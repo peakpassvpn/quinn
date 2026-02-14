@@ -9,6 +9,7 @@ use crate::congestion::ControllerMetrics;
 use crate::congestion::bbr::bw_estimation::BandwidthEstimation;
 use crate::congestion::bbr::min_max::MinMax;
 use crate::connection::RttEstimator;
+use crate::packet::SpaceId;
 use crate::{Duration, Instant};
 
 use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
@@ -403,6 +404,8 @@ impl Controller for Bbr {
         now: Instant,
         sent: Instant,
         bytes: u64,
+        _pn: u64,
+        _space: SpaceId,
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
@@ -419,6 +422,7 @@ impl Controller for Bbr {
         in_flight: u64,
         app_limited: bool,
         largest_packet_num_acked: Option<u64>,
+        _space: SpaceId,
     ) {
         let bytes_acked = self.max_bandwidth.bytes_acked_this_window();
         let excess_acked = self.ack_aggregation.update_ack_aggregation_bytes(
@@ -485,6 +489,8 @@ impl Controller for Bbr {
         _is_persistent_congestion: bool,
         _is_ecn: bool,
         lost_bytes: u64,
+        _largest_lost: u64,
+        _space: SpaceId,
     ) {
         self.loss_state.lost_bytes += lost_bytes;
     }
@@ -694,10 +700,16 @@ mod tests {
         }
         let mut ack_at = now + Duration::from_millis(20);
         for _ in 0..packets {
-            bbr.on_ack(ack_at, now, packet_size, app_limited, rtt);
+            bbr.on_ack(ack_at, now, packet_size, 0, SpaceId::Data, app_limited, rtt);
             ack_at += spacing;
         }
-        bbr.on_end_acks(ack_at, 0, app_limited, Some(first + packets - 1));
+        bbr.on_end_acks(
+            ack_at,
+            0,
+            app_limited,
+            Some(first + packets - 1),
+            SpaceId::Data,
+        );
         ack_at
     }
 
@@ -871,10 +883,10 @@ mod tests {
             }
             let mut ack_at = now + delay;
             for _ in 0..33 {
-                bbr.on_ack(ack_at, now, 1200, false, rtt);
+                bbr.on_ack(ack_at, now, 1200, 0, SpaceId::Data, false, rtt);
                 ack_at += spacing;
             }
-            bbr.on_end_acks(ack_at, 0, false, Some(first + 32));
+            bbr.on_end_acks(ack_at, 0, false, Some(first + 32), SpaceId::Data);
             ack_at
         }
 
