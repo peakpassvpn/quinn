@@ -40,6 +40,7 @@ pub struct TransportConfig {
     pub(crate) min_mtu: u16,
     pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
     pub(crate) pad_to_mtu: bool,
+    pub(crate) scramble_client_hello: bool,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
 
     pub(crate) persistent_congestion_threshold: u32,
@@ -236,6 +237,19 @@ impl TransportConfig {
         self
     }
 
+    /// Scatter the TLS ClientHello across the client's first Initial packets
+    ///
+    /// Enabled by default; only affects clients. The ClientHello is split at random points,
+    /// including inside the server_name (and ECH) extension, into several CRYPTO frames that are
+    /// sent out of order and interleaved with PING and PADDING frames, as Chrome's "chaos
+    /// protection" and quic-go do. Middleboxes that decrypt the (publicly keyed) Initial packet and
+    /// expect the whole ClientHello in one CRYPTO frame at offset 0 then can't read the SNI.
+    /// Conforming QUIC servers reassemble the frames as usual.
+    pub fn scramble_client_hello(&mut self, value: bool) -> &mut Self {
+        self.scramble_client_hello = value;
+        self
+    }
+
     /// Specifies the ACK frequency config (see [`AckFrequencyConfig`] for details)
     ///
     /// The provided configuration will be ignored if the peer does not support the acknowledgement
@@ -385,6 +399,7 @@ impl Default for TransportConfig {
             min_mtu: INITIAL_MTU,
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
             pad_to_mtu: false,
+            scramble_client_hello: true,
             ack_frequency_config: None,
 
             persistent_congestion_threshold: 3,
@@ -422,6 +437,7 @@ impl fmt::Debug for TransportConfig {
             min_mtu,
             mtu_discovery_config,
             pad_to_mtu,
+            scramble_client_hello,
             ack_frequency_config,
             persistent_congestion_threshold,
             keep_alive_interval,
@@ -451,6 +467,7 @@ impl fmt::Debug for TransportConfig {
             .field("min_mtu", min_mtu)
             .field("mtu_discovery_config", mtu_discovery_config)
             .field("pad_to_mtu", pad_to_mtu)
+            .field("scramble_client_hello", scramble_client_hello)
             .field("ack_frequency_config", ack_frequency_config)
             .field(
                 "persistent_congestion_threshold",

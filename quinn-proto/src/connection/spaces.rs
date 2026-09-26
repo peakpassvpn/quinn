@@ -54,6 +54,8 @@ pub(super) struct PacketSpace {
     pub(super) crypto_stream: Assembler,
     /// Current offset of outgoing cryptographic handshake stream
     pub(super) crypto_offset: u64,
+    /// Frames to interleave with a scattered ClientHello, one per queued CRYPTO frame
+    pub(super) chaos: VecDeque<super::chaos::Filler>,
 
     /// The time the most recently sent retransmittable packet was sent.
     pub(super) time_of_last_ack_eliciting_packet: Option<Instant>,
@@ -90,6 +92,7 @@ impl PacketSpace {
 
             crypto_stream: Assembler::new(),
             crypto_offset: 0,
+            chaos: VecDeque::new(),
 
             time_of_last_ack_eliciting_packet: None,
             loss_time: None,

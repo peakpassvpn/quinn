@@ -4180,3 +4180,210 @@ fn preferred_address() {
     let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
     pair.connect();
 }
+
+/// Decrypt the client's queued datagrams and return the frames of each Initial packet
+///
+/// The datagrams stay queued for delivery.
+fn client_initial_frames(pair: &mut Pair) -> Vec<Vec<frame::Frame>> {
+    pair.client.drive_outgoing(pair.time);
+    let server_crypto = server_crypto();
+    let mut packets = Vec::new();
+    for (transmit, datagram) in pair.client.outbound.iter() {
+        assert!(transmit.size >= MIN_INITIAL_SIZE as usize);
+        let mut rest = Some(BytesMut::from(&datagram[..]));
+        while let Some(data) = rest.take() {
+            let (partial, remaining) = PartialDecode::new(
+                data,
+                &FixedLengthConnectionIdParser::new(8),
+                DEFAULT_SUPPORTED_VERSIONS,
+                false,
+            )
+            .unwrap();
+            rest = remaining;
+            if !partial.is_initial() {
+                continue;
+            }
+            let keys = crypto::ServerConfig::initial_keys(
+                &server_crypto,
+                DEFAULT_SUPPORTED_VERSIONS[0],
+                partial.dst_cid(),
+            )
+            .unwrap();
+            let mut packet = partial.finish(Some(&*keys.header.remote)).unwrap();
+            let pn = packet.header.number().unwrap().expand(0);
+            keys.packet
+                .remote
+                .decrypt(pn, &packet.header_data, &mut packet.payload)
+                .unwrap();
+            let frames = frame::Iter::new(packet.payload.freeze())
+                .unwrap()
+                .map(|f| f.unwrap())
+                .collect::<Vec<_>>();
+            packets.push(frames);
+        }
+    }
+    packets
+}
+
+/// Reassemble CRYPTO frames at Initial level; checks that they cover a single ClientHello
+fn reassemble_client_hello(frames: &[&frame::Crypto]) -> Vec<u8> {
+    let mut sorted = frames.to_vec();
+    sorted.sort_by_key(|f| f.offset);
+    let mut hello = Vec::new();
+    for f in sorted {
+        assert_eq!(
+            f.offset,
+            hello.len() as u64,
+            "gap or overlap in CRYPTO data"
+        );
+        hello.extend_from_slice(&f.data);
+    }
+    assert_eq!(hello[0], 1, "not a ClientHello");
+    let len = u32::from_be_bytes([0, hello[1], hello[2], hello[3]]) as usize;
+    assert_eq!(hello.len(), 4 + len, "incomplete ClientHello");
+    hello
+}
+
+fn crypto_frames(packets: &[Vec<frame::Frame>]) -> Vec<&frame::Crypto> {
+    packets
+        .iter()
+        .flatten()
+        .filter_map(|f| match f {
+            frame::Frame::Crypto(c) => Some(c),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn client_hello_scattered() {
+    let _guard = subscribe();
+    for _ in 0..20 {
+        let mut pair = Pair::default();
+        let client_ch = pair.begin_connect(client_config());
+        let packets = client_initial_frames(&mut pair);
+        assert_eq!(packets.len(), 1);
+        let frames = &packets[0];
+        let crypto = crypto_frames(&packets);
+        assert!(crypto.len() >= 3, "{} CRYPTO frames", crypto.len());
+        assert_ne!(crypto[0].offset, 0, "ClientHello start sent first");
+        assert!(frames.iter().any(|f| matches!(f, frame::Frame::Ping)));
+        // PADDING in between frames, not only trailing
+        let last_crypto = frames
+            .iter()
+            .rposition(|f| matches!(f, frame::Frame::Crypto(_)))
+            .unwrap();
+        assert!(
+            frames[..last_crypto]
+                .iter()
+                .any(|f| matches!(f, frame::Frame::Padding))
+        );
+        for c in &crypto {
+            assert!(
+                !c.data.windows(9).any(|w| w == b"localhost"),
+                "SNI in a single CRYPTO frame"
+            );
+        }
+        let hello = reassemble_client_hello(&crypto);
+        assert!(hello.windows(9).any(|w| w == b"localhost"));
+
+        // The server reads the scattered hello
+        pair.drive();
+        assert_matches!(
+            pair.client_conn_mut(client_ch).poll(),
+            Some(Event::HandshakeDataReady)
+        );
+        assert_matches!(
+            pair.client_conn_mut(client_ch).poll(),
+            Some(Event::Connected)
+        );
+    }
+}
+
+#[test]
+fn client_hello_scattered_over_two_packets() {
+    let _guard = subscribe();
+    // Enough ALPN protocols to push the ClientHello past one packet
+    let protocols = (0..40u8)
+        .map(|i| format!("protocol-{i:02}-padding-padding").into_bytes())
+        .collect::<Vec<_>>();
+    let server =
+        ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(protocols[..1].to_vec())));
+    for _ in 0..10 {
+        let mut pair = Pair::new(Default::default(), server.clone());
+        let client_ch = pair.begin_connect(ClientConfig::new(Arc::new(client_crypto_with_alpn(
+            protocols.clone(),
+        ))));
+        let packets = client_initial_frames(&mut pair);
+        assert_eq!(packets.len(), 2);
+        let crypto = crypto_frames(&packets);
+        assert_ne!(crypto[0].offset, 0);
+        let hello = reassemble_client_hello(&crypto);
+        assert!(hello.len() > 1200);
+        pair.drive();
+        assert_matches!(
+            pair.client_conn_mut(client_ch).poll(),
+            Some(Event::HandshakeDataReady)
+        );
+        assert_matches!(
+            pair.client_conn_mut(client_ch).poll(),
+            Some(Event::Connected)
+        );
+    }
+}
+
+#[test]
+fn client_hello_scrambling_disabled() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let mut config = client_config();
+    let mut transport = TransportConfig::default();
+    transport.scramble_client_hello(false);
+    config.transport_config(Arc::new(transport));
+    let client_ch = pair.begin_connect(config);
+    let packets = client_initial_frames(&mut pair);
+    let crypto = crypto_frames(&packets);
+    assert_eq!(crypto.len(), 1);
+    assert_eq!(crypto[0].offset, 0);
+    assert!(!packets[0].iter().any(|f| matches!(f, frame::Frame::Ping)));
+    reassemble_client_hello(&crypto);
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+}
+
+#[test]
+fn client_hello_scattered_after_retry() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(|incoming| {
+        if incoming.remote_address_validated() {
+            IncomingConnectionBehavior::Accept
+        } else {
+            IncomingConnectionBehavior::Retry
+        }
+    });
+    let client_ch = pair.begin_connect(client_config());
+    // First flight, answered with a Retry
+    pair.drive_client();
+    pair.drive_server();
+    pair.client.drive_incoming(pair.time, pair.server.addr);
+    // The Initial carrying the token scatters the ClientHello anew
+    let packets = client_initial_frames(&mut pair);
+    let crypto = crypto_frames(&packets);
+    assert!(crypto.len() >= 3);
+    assert_ne!(crypto[0].offset, 0);
+    reassemble_client_hello(&crypto);
+    pair.drive();
+    assert_eq!(pair.server.known_connections(), 1);
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Connected)
+    );
+}

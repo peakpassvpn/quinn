@@ -41,6 +41,8 @@ mod ack_frequency;
 use ack_frequency::AckFrequencyState;
 
 mod assembler;
+
+mod chaos;
 pub use assembler::Chunk;
 
 mod cid_state;
@@ -2171,18 +2173,40 @@ impl Connection {
             }
             let offset = self.spaces[space].crypto_offset;
             let outgoing = Bytes::from(outgoing);
+            let is_client_hello = space == SpaceId::Initial && offset == 0 && self.side.is_client();
             if let State::Handshake(ref mut state) = self.state {
-                if space == SpaceId::Initial && offset == 0 && self.side.is_client() {
+                if is_client_hello {
                     state.client_hello = Some(outgoing.clone());
                 }
             }
             self.spaces[space].crypto_offset += outgoing.len() as u64;
             trace!("wrote {} {:?} CRYPTO bytes", outgoing.len(), space);
-            self.spaces[space].pending.crypto.push_back(frame::Crypto {
-                offset,
-                data: outgoing,
-            });
+            if is_client_hello {
+                self.queue_client_hello(outgoing);
+            } else {
+                self.spaces[space].pending.crypto.push_back(frame::Crypto {
+                    offset,
+                    data: outgoing,
+                });
+            }
         }
+    }
+
+    /// Queue the ClientHello for the first flight, scattered unless disabled
+    fn queue_client_hello(&mut self, hello: Bytes) {
+        let space = &mut self.spaces[SpaceId::Initial];
+        if self.config.scramble_client_hello {
+            if let Some((frames, fillers)) = chaos::scatter(0, &hello, &mut self.rng) {
+                trace!("scattering ClientHello over {} CRYPTO frames", frames.len());
+                space.pending.crypto.extend(frames);
+                space.chaos.extend(fillers);
+                return;
+            }
+        }
+        space.pending.crypto.push_back(frame::Crypto {
+            offset: 0,
+            data: hello,
+        });
     }
 
     /// Switch to stronger cryptography during handshake
@@ -2519,13 +2543,7 @@ impl Connection {
                     crypto_offset: client_hello.len() as u64,
                     ..PacketSpace::new(now)
                 };
-                self.spaces[SpaceId::Initial]
-                    .pending
-                    .crypto
-                    .push_back(frame::Crypto {
-                        offset: 0,
-                        data: client_hello,
-                    });
+                self.queue_client_hello(client_hello);
 
                 // Retransmit all 0-RTT data
                 let zero_rtt = mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
@@ -3269,6 +3287,39 @@ impl Connection {
                 Some(x) => x,
                 None => break,
             };
+
+            // Interleave PING and PADDING with a scattered ClientHello
+            if let Some(filler) = space.chaos.pop_front() {
+                for _ in 0..filler.pings {
+                    if buf.len() + 1 + frame::Crypto::SIZE_BOUND >= max_size {
+                        break;
+                    }
+                    // Decoys, like PADDING, so not counted in `frame_tx.ping`
+                    trace!("PING");
+                    buf.write(frame::FrameType::PING);
+                    sent.non_retransmits = true;
+                }
+                if filler.padding {
+                    // Only pad with room the remaining CRYPTO frames don't need, so padding never
+                    // pushes ClientHello data into another packet
+                    let crypto_size = |f: &frame::Crypto| {
+                        1 + VarInt::size(unsafe { VarInt::from_u64_unchecked(f.offset) })
+                            + 2
+                            + f.data.len()
+                    };
+                    let needed = crypto_size(&frame)
+                        + space.pending.crypto.iter().map(crypto_size).sum::<usize>()
+                        + space.chaos.iter().map(|f| f.pings as usize).sum::<usize>()
+                        + frame::Crypto::SIZE_BOUND;
+                    let spare = max_size.saturating_sub(buf.len() + needed);
+                    let slots = 1 + space.chaos.iter().filter(|f| f.padding).count();
+                    let len = self.rng.random_range(0..=2 * (spare / slots)).min(spare);
+                    if len > 0 {
+                        trace!("PADDING * {}", len);
+                        buf.resize(buf.len() + len, 0);
+                    }
+                }
+            }
 
             // Calculate the maximum amount of crypto data we can store in the buffer.
             // Since the offset is known, we can reserve the exact size required to encode it.
