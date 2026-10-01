@@ -885,8 +885,20 @@ impl Connection {
                 }
             }
 
-            let sent =
-                self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            // A scattered ClientHello's padding keeps the datagram within the minimum MTU, as
+            // upstream pads Initials to it: the path is not known to carry more yet
+            let pad_max = Ord::min(
+                builder.max_size,
+                (builder.datagram_start + usize::from(min_mtu)).saturating_sub(builder.tag_len),
+            );
+            let sent = self.populate_packet(
+                now,
+                space_id,
+                buf,
+                builder.max_size,
+                pad_max,
+                builder.exact_number,
+            );
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write
@@ -3174,6 +3186,7 @@ impl Connection {
         space_id: SpaceId,
         buf: &mut Vec<u8>,
         max_size: usize,
+        pad_max: usize,
         pn: u64,
     ) -> SentFrames {
         let mut sent = SentFrames::default();
@@ -3308,7 +3321,7 @@ impl Connection {
                         + space.pending.crypto.iter().map(crypto_size).sum::<usize>()
                         + space.chaos.iter().map(|f| f.pings as usize).sum::<usize>()
                         + frame::Crypto::SIZE_BOUND;
-                    let spare = max_size.saturating_sub(buf.len() + needed);
+                    let spare = pad_max.saturating_sub(buf.len() + needed);
                     let slots = 1 + space.chaos.iter().filter(|f| f.padding).count();
                     let len = self.rng.random_range(0..=2 * (spare / slots)).min(spare);
                     if len > 0 {
