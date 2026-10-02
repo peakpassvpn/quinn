@@ -322,6 +322,11 @@ impl RttEstimator {
         self.get().max(self.latest)
     }
 
+    /// The most recent RTT sample, ack delay included.
+    pub fn latest(&self) -> Duration {
+        self.latest
+    }
+
     /// Minimum RTT registered so far for this estimator.
     pub fn min(&self) -> Duration {
         self.min

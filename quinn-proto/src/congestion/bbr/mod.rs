@@ -44,8 +44,11 @@ pub struct Bbr {
     min_cwnd: u64,
     prev_in_flight_count: u64,
     exit_probe_rtt_at: Option<Instant>,
-    probe_rtt_last_started_at: Option<Instant>,
     min_rtt: Duration,
+    /// When `min_rtt` was last set: it expires `MIN_RTT_EXPIRY` later.
+    min_rtt_timestamp: Option<Instant>,
+    /// The lowest RTT sample of the ACKs being processed.
+    ack_min_rtt: Option<Duration>,
     exiting_quiescence: bool,
     pacing_rate: u64,
     max_acked_packet_number: u64,
@@ -85,8 +88,9 @@ impl Bbr {
             min_cwnd: calculate_min_window(current_mtu as u64),
             prev_in_flight_count: 0,
             exit_probe_rtt_at: None,
-            probe_rtt_last_started_at: None,
             min_rtt: Default::default(),
+            min_rtt_timestamp: None,
+            ack_min_rtt: None,
             exiting_quiescence: false,
             pacing_rate: 0,
             max_acked_packet_number: 0,
@@ -210,12 +214,9 @@ impl Bbr {
         }
     }
 
-    fn is_min_rtt_expired(&self, now: Instant, app_limited: bool) -> bool {
-        !app_limited
-            && self
-                .probe_rtt_last_started_at
-                .map(|last| now.saturating_duration_since(last) > Duration::from_secs(10))
-                .unwrap_or(true)
+    fn is_min_rtt_expired(&self, now: Instant) -> bool {
+        self.min_rtt_timestamp
+            .is_some_and(|stamp| now.saturating_duration_since(stamp) > MIN_RTT_EXPIRY)
     }
 
     fn maybe_enter_or_exit_probe_rtt(
@@ -223,16 +224,14 @@ impl Bbr {
         now: Instant,
         is_round_start: bool,
         bytes_in_flight: u64,
-        app_limited: bool,
+        min_rtt_expired: bool,
     ) {
-        let min_rtt_expired = self.is_min_rtt_expired(now, app_limited);
         if min_rtt_expired && !self.exiting_quiescence && self.mode != Mode::ProbeRtt {
             self.mode = Mode::ProbeRtt;
             self.pacing_gain = 1.0;
             // Do not decide on the time to exit ProbeRtt until the
             // |bytes_in_flight| is at the target small value.
             self.exit_probe_rtt_at = None;
-            self.probe_rtt_last_started_at = Some(now);
         }
 
         if self.mode == Mode::ProbeRtt {
@@ -248,6 +247,8 @@ impl Bbr {
                     }
                 }
                 Some(exit_time) if is_round_start && now >= exit_time => {
+                    // ProbeRtt measured the minimum afresh.
+                    self.min_rtt_timestamp = Some(now);
                     if !self.is_at_full_bandwidth {
                         self.enter_startup_mode();
                     } else {
@@ -408,9 +409,8 @@ impl Controller for Bbr {
         self.max_bandwidth
             .on_ack(now, sent, bytes, self.round_count, app_limited);
         self.acked_bytes += bytes;
-        if self.is_min_rtt_expired(now, app_limited) || self.min_rtt > rtt.min() {
-            self.min_rtt = rtt.min();
-        }
+        let sample = rtt.latest();
+        self.ack_min_rtt = Some(self.ack_min_rtt.map_or(sample, |min| min.min(sample)));
     }
 
     fn on_end_acks(
@@ -430,6 +430,19 @@ impl Controller for Bbr {
         self.max_bandwidth.end_acks(self.round_count, app_limited);
         if let Some(largest_acked_packet) = largest_packet_num_acked {
             self.max_acked_packet_number = largest_acked_packet;
+        }
+
+        // The minimum RTT over a window of MIN_RTT_EXPIRY, as quiche keeps it: the lowest
+        // sample of these ACKs replaces it when lower, or when the one kept has expired. Not the
+        // connection's lifetime minimum, which never rises: one low sample would then size the
+        // window for the rest of a long-lived connection whose path got slower.
+        let mut min_rtt_expired = false;
+        if let Some(sample) = self.ack_min_rtt.take() {
+            min_rtt_expired = self.is_min_rtt_expired(now);
+            if min_rtt_expired || self.min_rtt.is_zero() || sample < self.min_rtt {
+                self.min_rtt = sample;
+                self.min_rtt_timestamp = Some(now);
+            }
         }
 
         let mut is_round_start = false;
@@ -454,7 +467,7 @@ impl Controller for Bbr {
 
         self.maybe_exit_startup_or_drain(now, in_flight);
 
-        self.maybe_enter_or_exit_probe_rtt(now, is_round_start, in_flight, app_limited);
+        self.maybe_enter_or_exit_probe_rtt(now, is_round_start, in_flight, min_rtt_expired);
 
         // After the model is updated, recalculate the pacing rate and congestion window.
         self.calculate_pacing_rate();
@@ -648,6 +661,8 @@ const K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP: u8 = 3;
 const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
 
 const PROBE_RTT_BASED_ON_BDP: bool = true;
+/// How long a minimum RTT is kept before a new sample replaces it, as quiche's kMinRttExpiry.
+const MIN_RTT_EXPIRY: Duration = Duration::from_secs(10);
 const DRAIN_TO_TARGET: bool = true;
 
 #[cfg(test)]
@@ -689,10 +704,9 @@ mod tests {
     fn app_limited_startup_does_not_grow_cwnd_beyond_target_window() {
         let mut now = Instant::now();
         let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
-        // Suppress the connection-open ProbeRtt pass (min_rtt "expires" while
-        // unset); these tests exercise the STARTUP window arithmetic only.
-        bbr.probe_rtt_last_started_at = Some(now);
-        // ... and stand in for the min_rtt it would have established.
+        // Stand in for the min_rtt the first samples would have established;
+        // set without a timestamp, it does not expire into ProbeRtt, and
+        // these tests exercise the STARTUP window arithmetic only.
         bbr.min_rtt = Duration::from_millis(20);
         let rtt = RttEstimator::new(Duration::from_millis(20));
         let mut pn = 0u64;
@@ -751,7 +765,6 @@ mod tests {
         // arithmetic engages and the window stays near the real BDP.
         let mut now = Instant::now();
         let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
-        bbr.probe_rtt_last_started_at = Some(now);
         bbr.min_rtt = Duration::from_millis(20);
         let rtt = RttEstimator::new(Duration::from_millis(20));
         let mut pn = 0u64;
@@ -788,9 +801,7 @@ mod tests {
     fn startup_cwnd_grows_while_below_target_window() {
         let mut now = Instant::now();
         let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
-        // Suppress the connection-open ProbeRtt pass (see the test above).
-        bbr.probe_rtt_last_started_at = Some(now);
-        // ... and stand in for the min_rtt it would have established.
+        // A min_rtt without a timestamp, as in the tests above.
         bbr.min_rtt = Duration::from_millis(20);
         let rtt = RttEstimator::new(Duration::from_millis(20));
         let mut pn = 0u64;
@@ -831,6 +842,75 @@ mod tests {
             "STARTUP must keep ramping cwnd toward a large target, got {} (init_cwnd {})",
             bbr.cwnd,
             bbr.init_cwnd
+        );
+    }
+
+    /// The path's RTT rises for good, as when a long-lived connection moves
+    /// onto a slower route, or a cell of lower delay ends: the minimum RTT
+    /// must follow it once the old one expires, or the window stays sized
+    /// for the old path and throughput collapses for the connection's life.
+    #[test]
+    fn min_rtt_expires_when_the_path_gets_slower() {
+        // One round trip of `rtt`: 33 packets sent 600 us apart, acked one
+        // RTT later at the same spacing (2 MB/s samples), not app-limited.
+        fn round(
+            bbr: &mut Bbr,
+            rtt: &RttEstimator,
+            now: Instant,
+            pn: &mut u64,
+            delay: Duration,
+        ) -> Instant {
+            let spacing = Duration::from_micros(600);
+            let first = *pn;
+            let mut send_at = now;
+            for _ in 0..33 {
+                bbr.on_sent(send_at, 1200, *pn);
+                *pn += 1;
+                send_at += spacing;
+            }
+            let mut ack_at = now + delay;
+            for _ in 0..33 {
+                bbr.on_ack(ack_at, now, 1200, false, rtt);
+                ack_at += spacing;
+            }
+            bbr.on_end_acks(ack_at, 0, false, Some(first + 32));
+            ack_at
+        }
+
+        let mut now = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let mut rtt = RttEstimator::new(Duration::from_millis(20));
+        let mut pn = 0u64;
+
+        // 5 s of a 20 ms path.
+        let fast = Duration::from_millis(20);
+        rtt.update(Duration::ZERO, fast);
+        let end = now + Duration::from_secs(5);
+        while now < end {
+            now = round(&mut bbr, &rtt, now, &mut pn, fast);
+        }
+        assert_eq!(bbr.min_rtt, fast);
+
+        // Then 20 s of a 150 ms path with steady delivery.
+        let slow = Duration::from_millis(150);
+        rtt.update(Duration::ZERO, slow);
+        let end = now + Duration::from_secs(20);
+        while now < end {
+            now = round(&mut bbr, &rtt, now, &mut pn, slow);
+        }
+
+        assert!(
+            bbr.min_rtt >= slow,
+            "min_rtt must follow the slower path, got {:?}",
+            bbr.min_rtt
+        );
+        // The delay-bandwidth product of the 150 ms path at the 2 MB/s the
+        // samples show.
+        let bdp = 2_000_000 * slow.as_millis() as u64 / 1000;
+        assert!(
+            bbr.window() >= bdp,
+            "the window must cover the 150 ms path's BDP ({bdp}), got {}",
+            bbr.window()
         );
     }
 }
