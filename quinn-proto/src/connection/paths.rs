@@ -322,11 +322,6 @@ impl RttEstimator {
         self.get().max(self.latest)
     }
 
-    /// The most recent RTT sample, ack delay included.
-    pub fn latest(&self) -> Duration {
-        self.latest
-    }
-
     /// Minimum RTT registered so far for this estimator.
     pub fn min(&self) -> Duration {
         self.min
@@ -504,6 +499,49 @@ mod tests {
                 &metrics
             ),
             None
+        );
+    }
+
+    /// BBR's pacing rate is what the pacer sends at, not the 5/4 of a window per smoothed RTT
+    /// that it derives for a controller without a rate.
+    #[test]
+    fn bbr_paces_at_its_own_rate() {
+        let now = Instant::now();
+        let mut config = TransportConfig::default();
+        config.congestion_controller_factory(std::sync::Arc::new(
+            crate::congestion::Bbr3Config::default(),
+        ));
+        let remote = "203.0.113.1:4433".parse().unwrap();
+        let mut path = PathData::new(remote, true, None, 0, now, &config);
+        let mtu = path.current_mtu();
+        let metrics = path.congestion.metrics();
+        let rate = metrics.pacing_rate.expect("BBR reports a pacing rate") as f64;
+        // Before an RTT sample, the two differ by orders of magnitude: BBR assumes a 1 ms
+        // RTT, the window path the configured initial RTT.
+        let window_rate = 1.25 * metrics.congestion_window as f64 / path.rtt.get().as_secs_f64();
+        assert!(rate > 10.0 * window_rate);
+
+        let period = Duration::from_millis(100);
+        let mut at = now;
+        let mut sent = 0;
+        while at < now + period {
+            match path
+                .pacing
+                .delay(path.rtt.get(), mtu.into(), mtu, at, &metrics)
+            {
+                None => {
+                    path.pacing.on_transmit(mtu);
+                    sent += u64::from(mtu);
+                }
+                Some(resume) => at = resume,
+            }
+        }
+        let expected = rate * period.as_secs_f64();
+        // Slack for the bucket the pacer starts full (at most 256 datagrams) and one datagram.
+        let slack = 257.0 * f64::from(mtu);
+        assert!(
+            (sent as f64 - expected).abs() <= slack,
+            "sent {sent} bytes in {period:?}, the pacing rate allows {expected}"
         );
     }
 }

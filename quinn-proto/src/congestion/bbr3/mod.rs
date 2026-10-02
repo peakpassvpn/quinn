@@ -8208,4 +8208,56 @@ mod test {
         assert!(marked.bbr.max_bw > 0.9 * control.bbr.max_bw);
         assert_eq!(marked.bbr.inflight_shortterm, u64::MAX);
     }
+
+    /// A seeded config, so the probe timing, and with it each run, is the same every time.
+    fn seeded() -> Bbr3Config {
+        Bbr3Config {
+            probe_rng_seed: Some([7; 16]),
+            ..Bbr3Config::default()
+        }
+    }
+
+    /// A path whose RTT steps up from 10ms to 100ms: the minimum RTT follows it within the
+    /// filter's length, and the window grows to the new bandwidth-delay product. A minimum
+    /// kept from the first path would size the window for a tenth of the new one, and the
+    /// flow would crawl at a fraction of the link.
+    #[test]
+    fn min_rtt_follows_an_rtt_step_up() {
+        const SEC: u64 = 1_000_000_000;
+        let mut sim = Sim::new(seeded(), 1200, LINK_BW, 10 * MS);
+        run_until(&mut sim, 2 * SEC);
+        assert!(sim.bbr.min_rtt < Duration::from_millis(15));
+
+        sim.fwd_ns = 50 * MS;
+        sim.ret_ns = 50 * MS;
+        run_until(&mut sim, (2 + MIN_RTT_FILTER_LEN + 1) * SEC);
+        assert!(
+            sim.bbr.min_rtt >= Duration::from_millis(100),
+            "min_rtt {:?} still holds the old path's",
+            sim.bbr.min_rtt
+        );
+
+        let delivered = run_until(&mut sim, (2 + MIN_RTT_FILTER_LEN + 11) * SEC);
+        assert!(
+            delivered as f64 > 0.8 * LINK_BW * 10.0,
+            "{delivered} bytes in 10 s, under 80% of the link"
+        );
+    }
+
+    /// Each ACK acknowledges a single packet, so every ACK is a rate sample of its own. The
+    /// bandwidth estimate still reaches the link's rate, rather than reading low as a per-ACK
+    /// estimator that divides one packet by an ACK interval can.
+    #[test]
+    fn per_ack_sampling_estimates_the_link_rate() {
+        const SEC: u64 = 1_000_000_000;
+        for (bw, rtt) in [(LINK_BW, LINK_RTT), (12_500_000.0, 50 * MS)] {
+            let mut sim = Sim::new(seeded(), 1200, bw, rtt);
+            run_until(&mut sim, 5 * SEC);
+            let estimate = sim.bbr.metrics().bandwidth_estimate.unwrap() as f64;
+            assert!(
+                estimate >= 0.95 * bw && estimate <= 1.05 * bw,
+                "estimate {estimate} B/s on a {bw} B/s link"
+            );
+        }
+    }
 }

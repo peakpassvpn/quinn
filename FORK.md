@@ -22,34 +22,42 @@ minor line (0.12) is a merge of that line, done when sail moves its
   unaffected. It is on by default;
   `TransportConfig::scramble_client_hello(false)` turns it off.
 
-- **BBR's window is bounded in Startup** (`quinn-proto`), from upstream
-  pull request #2798 (by poka-IT, not yet merged; same licence as quinn).
-  Startup grew the window while `cwnd_gain < target_window`, a gain
-  compared with a byte count, so on a connection that stays app-limited
-  the window followed the bytes acked without bound (over 300 MB was seen
-  on one TUIC connection), and a sender could flood a bottleneck.
-  It now grows while `cwnd < target_window`; the bandwidth filter takes
-  app-limited samples only when they raise it, and no zero-rate ones.
-  A stopgap: the bandwidth sampling itself still reads low, which a
-  BBRv3 port (upstream #2481) is to replace.
+- **BBR is BBRv3** (`quinn-proto`), from upstream pull request #2481
+  (by Tipuch, draft-ietf-ccwg-bbr-06; open, not merged into `main` or
+  `0.11.x`), with what it builds on: upstream `main`'s spurious-loss
+  detection (531ca90e, by Fabien Savy). It replaces quinn's BBRv1, whose
+  bandwidth estimate read low and whose pacing rate never reached the
+  pacer. It brings:
+  - finer controller events: each packet sent, acknowledged and lost by
+    packet number space, the window-limited and application-limited
+    signals, spurious losses, and the peer's ACK frequency. The
+    `Controller` trait's `on_ack`, `on_end_acks` and
+    `on_congestion_event` take the packet number and space;
+  - a pacer that sends at the controller's `pacing_rate` (bytes/s, was
+    bits/s) when it reports one, and a GSO batch bounded by its
+    `send_quantum`. Controllers without a rate (Cubic, NewReno) keep
+    0.11.x's window-derived pacing unchanged; upstream `main`'s 10 ms
+    burst cap and `max_outgoing_bytes_per_second` are not taken, so the
+    rate path bounds a burst as 0.11.x does (2 ms of traffic, 10 to 256
+    datagrams);
+  - BBR's response to classic ECN, from moq-dev/noq pull request #12
+    (by Luke Curley; noq is MIT OR Apache-2.0, as quinn): CE stops
+    Startup, ends a bandwidth probe, or cuts the short-term model, once
+    per recovery episode, instead of being handled as a zero-byte loss.
 
-- **BBR's minimum RTT expires** (`quinn-proto`). BBR took the
-  connection's lifetime minimum RTT (`RttEstimator::min`), which never
-  rises, and ProbeRtt could not refresh it. On a long-lived connection,
-  which a Hysteria2 client keeps for all its traffic, one low sample
-  (an undelayed path, a few packets that a reordering link let through
-  early) sized the window for good: when the path's RTT later rose, the
-  window stayed at a few packets and throughput collapsed for the rest
-  of the connection's life (0.5 Mbit/s on a 50 Mbit/s, 150 ms path, with
-  min_rtt still 42 us). As quiche keeps it, the minimum is now the
-  lowest of the latest RTT samples (`RttEstimator::latest`, added) over
-  a 10 s window: it expires 10 s after it was set, the next ACKs' sample
-  replaces it and starts ProbeRtt, and leaving ProbeRtt stamps it anew.
-  Upstream `main` still uses `rtt.min()`; the BBRv3 port (upstream
-  #2481), which has a windowed min-RTT filter, is to replace this.
+  Adapted to 0.11.x: let-chains are rewritten for edition 2021; Cubic
+  keeps no undo state for spurious losses, so its behaviour is
+  unchanged; `Bbr` and `BbrConfig` remain as names for `Bbr3` and
+  `Bbr3Config`. BBRv3's own logic supersedes this fork's two earlier BBR
+  patches, which went with BBRv1: the Startup window bound (from
+  upstream #2798) and the expiring minimum RTT (BBRv3's min-RTT filter
+  and ProbeRTT refresh it every 10 s and 5 s). The fork's tests that a
+  minimum RTT follows a path whose RTT steps up, and that per-ACK
+  samples estimate the link's rate, now test BBRv3.
 
 ## When it could go away
 
 When upstream quinn scatters the client's first CRYPTO data itself (no
-such change is in upstream `main` or `0.11.x` today). sail would then set
-upstream's option and drop the `[patch.crates-io]` entry.
+such change is in upstream `main` or `0.11.x` today) and ships BBRv3
+in the line sail uses. sail would then set upstream's option and drop
+the `[patch.crates-io]` entry.

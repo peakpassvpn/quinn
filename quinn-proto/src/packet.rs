@@ -893,6 +893,7 @@ pub enum SpaceId {
 }
 
 impl SpaceId {
+    /// The packet number spaces, in the order a connection uses them
     pub fn iter() -> impl Iterator<Item = Self> {
         [Self::Initial, Self::Handshake, Self::Data].iter().cloned()
     }

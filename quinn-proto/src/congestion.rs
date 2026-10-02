@@ -11,6 +11,8 @@ mod cubic;
 mod new_reno;
 
 pub use bbr3::{Bbr3, Bbr3Config};
+/// 0.11.x's names for BBR, which is BBRv3 since this fork replaced BBRv1
+pub use bbr3::{Bbr3 as Bbr, Bbr3Config as BbrConfig};
 pub use cubic::{Cubic, CubicConfig};
 pub use new_reno::{NewReno, NewRenoConfig};
 
