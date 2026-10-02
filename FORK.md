@@ -22,6 +22,17 @@ minor line (0.12) is a merge of that line, done when sail moves its
   unaffected. It is on by default;
   `TransportConfig::scramble_client_hello(false)` turns it off.
 
+- **BBR's window is bounded in Startup** (`quinn-proto`), from upstream
+  pull request #2798 (by poka-IT, not yet merged; same licence as quinn).
+  Startup grew the window while `cwnd_gain < target_window`, a gain
+  compared with a byte count, so on a connection that stays app-limited
+  the window followed the bytes acked without bound (over 300 MB was seen
+  on one TUIC connection), and a sender could flood a bottleneck.
+  It now grows while `cwnd < target_window`; the bandwidth filter takes
+  app-limited samples only when they raise it, and no zero-rate ones.
+  A stopgap: the bandwidth sampling itself still reads low, which a
+  BBRv3 port (upstream #2481) is to replace.
+
 ## When it could go away
 
 When upstream quinn scatters the client's first CRYPTO data itself (no
