@@ -934,6 +934,7 @@ impl ConnectionRef {
                 socket,
                 runtime,
                 send_buffer: Vec::new(),
+                unbatched_passes: 0,
                 buffered_transmit: None,
             }),
             shared: Shared::default(),
@@ -1017,6 +1018,9 @@ pub(crate) struct State {
     io_poller: Pin<Box<dyn UdpPoller>>,
     runtime: Arc<dyn Runtime>,
     send_buffer: Vec<u8>,
+    /// How many `drive_transmit` passes in a row ended with nothing left to send and without
+    /// having sent a segmented batch; see [`SEND_BUFFER_IDLE_PASSES`]
+    unbatched_passes: u8,
     /// We buffer a transmit when the underlying I/O would block
     buffered_transmit: Option<proto::Transmit>,
 }
@@ -1045,11 +1049,19 @@ impl State {
                         Some(t) => {
                             transmits += match t.segment_size {
                                 None => 1,
-                                Some(s) => t.size.div_ceil(s), // round up
+                                Some(s) => {
+                                    self.unbatched_passes = 0;
+                                    t.size.div_ceil(s) // round up
+                                }
                             };
                             t
                         }
-                        None => break,
+                        None => {
+                            // Nothing is left to send, and nothing is buffered for a retry:
+                            // `send_buffer` is empty and free to shrink.
+                            self.release_idle_send_buffer();
+                            break;
+                        }
                     }
                 }
             };
@@ -1088,6 +1100,36 @@ impl State {
         }
 
         Ok(false)
+    }
+
+    /// Gives back the batch-sized `send_buffer` of a connection that has stopped sending batches
+    ///
+    /// Called when a pass ends with nothing left to send. `poll_transmit` grows the buffer to
+    /// hold a whole batch, [`MAX_TRANSMIT_SEGMENTS`] segments beyond the first: about 25 KB at
+    /// 16 x 1452 bytes, where 10 segments made it about 16 KB. Upstream keeps it for a
+    /// connection's life, on a server whose clients are nearly all idle or only acknowledging
+    /// what they receive.
+    ///
+    /// A pass ending with nothing to send is not by itself idleness: a connection sending at
+    /// full rate ends most passes that way, blocked by congestion control or pacing until
+    /// the next ACK, and shrinking there would reallocate the buffer for every batch, the
+    /// cost upstream reserves a batch upfront to avoid. So the buffer goes only after
+    /// [`SEND_BUFFER_IDLE_PASSES`] such passes in a row with no segmented transmit among
+    /// them; any segmented transmit starts the count again.
+    ///
+    /// Shrinking cannot leave the next transmit short: every pass reserves an MTU before
+    /// `poll_transmit`, which reserves the batch itself when the capacity is below what it
+    /// is about to write, and otherwise grows the `Vec` as it writes.
+    fn release_idle_send_buffer(&mut self) {
+        let mtu = self.inner.current_mtu() as usize;
+        self.unbatched_passes = self.unbatched_passes.saturating_add(1);
+        // A buffer that has only ever held single datagrams has one MTU's capacity; twice
+        // that leaves it alone across an MTU change.
+        if self.unbatched_passes >= SEND_BUFFER_IDLE_PASSES && self.send_buffer.capacity() > 2 * mtu
+        {
+            self.send_buffer.clear();
+            self.send_buffer.shrink_to(mtu);
+        }
     }
 
     fn forward_endpoint_events(&mut self) {
@@ -1358,6 +1400,17 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 20;
 /// allows, fails: the batch no longer fits one datagram (see
 /// [`MAX_TRANSMIT_BYTES`]).
 const MAX_TRANSMIT_SEGMENTS: usize = 16;
+
+/// After how many passes in a row without a segmented transmit a connection gives back its
+/// batch-sized send buffer
+///
+/// A judgement: more than the one or two empty passes that fall between the batches of a
+/// connection sending at full rate, and few enough that an idle connection, which runs a
+/// pass or two per keep-alive, gives the buffer back within a minute. Measured with it at
+/// 32 segments, a Hysteria2 client moving 1 GiB each way shrank and regrew the buffer 7 to
+/// 18 times on loopback and 41 to 54 times at 150 ms RTT, against some 23,000 batches per
+/// GiB sent.
+const SEND_BUFFER_IDLE_PASSES: u8 = 8;
 
 /// The most bytes a single transmit may hold
 ///

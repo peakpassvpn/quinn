@@ -6,7 +6,8 @@ version sail uses. sail takes `quinn-proto` and `quinn` from it, at one
 revision, through `[patch.crates-io]`; `quinn-udp`, which `quinn` depends
 on by path, then comes from here too, unpatched. Besides the patches
 below, the crates are the `0.11.x` line's tip, which can be a few
-upstream fixes ahead of the latest release on crates.io.
+upstream fixes ahead of the latest release on crates.io (see
+[Ahead of the release](#ahead-of-the-release)).
 
 Upstream is merged into `sail`, never rebased onto it, and the branch is
 never force-pushed: sail pins revisions of it. Moving to a new upstream
@@ -74,9 +75,53 @@ minor line (0.12) is a merge of that line, done when sail moves its
   one. The count is the least of 16, what the socket can segment, and
   what fits a datagram at the current MTU, (65535 - 8 - 40) / MTU: 7 at
   a 9000-byte MTU.
-  The cost is memory: a connection keeps its send buffer once it has
-  sent a batch, about 17 segments (25 KB at 1452) where it was 11
-  (16 KB). Upstream `main` still has 10.
+  The rows for 16, 20 and 32 were measured with the next patch applied.
+  The cost is memory, which the next patch takes back: the send buffer
+  grows to about 17 segments (25 KB at 1452) where it was 11 (16 KB).
+  Upstream `main` still has 10.
+
+- **An idle connection gives its send buffer back** (`quinn`). Upstream
+  keeps a connection's send buffer at the size of its largest batch for
+  the connection's life. With 16 segments that is about 25 KB against
+  16 KB, on a server whose clients are mostly idle or only acknowledge
+  what they receive. The buffer now shrinks to one MTU when a connection
+  has ended 8 transmit passes in a row with nothing left to send and
+  without a segmented send among them. Not at the first such pass: a
+  connection sending at full rate ends most passes blocked by congestion
+  control or pacing, and would reallocate for every batch. The next
+  transmit is unaffected: each one reserves what it writes.
+
+  8 is a judgement. Measured with it at 32 segments, a Hysteria2 client
+  that uploaded and then downloaded 1 GiB shrank and regrew its buffer
+  7 to 18 times on loopback and 41 to 54 times at 150 ms RTT, against
+  some 23,000 batches per GiB. The patch by itself costs nothing that
+  shows: at 10 segments an upload ran at 3537 Mbit/s and 2.88 CPU
+  seconds per GiB on loopback where the unpatched crate had 3545 and
+  2.90, and at 446 Mbit/s at 150 ms RTT against 449.
+
+  A sail Hysteria2 server on glibc with 1,000 clients that had each
+  downloaded 4 MiB and gone idle held, per connection, 162-174 KB
+  unpatched at 10 segments, 147-152 with this patch at 10, 153-163 at
+  16 and 174-191 at 32, where 32 without this patch held 259-271. glibc
+  keeps the freed space for reuse and the resident size stays there;
+  under mimalloc, at 32 segments, it fell by about 15% within 20 s of
+  the last download (one run).
+
+## Ahead of the release
+
+`quinn` is 0.11.12 with four upstream fixes from the `0.11.x` line that
+no release on crates.io has yet (upstream commits, as merged here):
+
+- `bcd86796`, `handshake_data` is cancellation-safe: retrying it after a
+  dropped call no longer panics.
+- `12d7f077`, a connection whose transmit fails is closed and its state
+  cleaned up before the error is returned.
+- `16ecc700`, a finished stream's waker is removed from
+  `blocked_readers` instead of going stale there.
+- `f97fb5aa`, `wait_idle` wakes when the endpoint driver is dropped
+  (backport of upstream #2901).
+
+`quinn-udp` is 0.5.16 as released, but for one line of a test.
 
 ## When it could go away
 
