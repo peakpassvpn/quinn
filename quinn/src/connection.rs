@@ -1026,10 +1026,10 @@ impl State {
         let now = self.runtime.now();
         let mut transmits = 0;
 
-        let max_datagrams = self
-            .socket
-            .max_transmit_segments()
-            .min(MAX_TRANSMIT_SEGMENTS);
+        let max_datagrams = max_transmit_segments(
+            self.socket.max_transmit_segments(),
+            self.inner.current_mtu(),
+        );
 
         loop {
             // Retry the last transmit, or get a new one.
@@ -1345,6 +1345,36 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 20;
 /// The maximum amount of datagrams that are sent in a single transmit
 ///
 /// This can be lower than the maximum platform capabilities, to avoid excessive
-/// memory allocations when calling `poll_transmit()`. Benchmarks have shown
-/// that numbers around 10 are a good compromise.
-const MAX_TRANSMIT_SEGMENTS: usize = 10;
+/// memory allocations when calling `poll_transmit()`: a connection keeps a send
+/// buffer of this many segments once it has sent a batch.
+///
+/// Upstream has 10. Measured with a Hysteria2 client uploading on Linux
+/// (medians), 10 -> 16 cost it 2.90 -> 2.58 CPU seconds per GiB on loopback,
+/// with 5% more throughput, 1.86 -> 1.60 at 150 ms RTT and 1.96 -> 1.69 at
+/// 50 ms, the throughput there within the 2-3% that two runs of 10 differed
+/// by. 20 and 32 save more CPU (2.54 and 2.45 on loopback), but their upload
+/// at 150 ms RTT was 4-5% below 10's, so 16 is the largest that loses
+/// nothing on a long path. 64, which is what Linux's `UDP_MAX_SEGMENTS`
+/// allows, fails: the batch no longer fits one datagram (see
+/// [`MAX_TRANSMIT_BYTES`]).
+const MAX_TRANSMIT_SEGMENTS: usize = 16;
+
+/// The most bytes a single transmit may hold
+///
+/// A segmented send goes to the kernel as one UDP datagram, which the kernel
+/// then splits, so all of it has to fit the 16-bit length of a datagram,
+/// headers included: 65535 - 8 (UDP) - 40 (IPv6, the larger IP header)
+/// = 65487. At an MTU of 1452 that is 45 segments (64 x 1452 = 92928 does not
+/// fit), at 1200 it is 54, and at a 9000-byte MTU it is 7.
+const MAX_TRANSMIT_BYTES: usize = 65535 - 8 - 40;
+
+/// How many datagrams a single transmit may hold
+///
+/// The least of [`MAX_TRANSMIT_SEGMENTS`], what the socket can segment, and what
+/// fits one datagram at the current MTU, which is the largest a segment gets.
+fn max_transmit_segments(socket_max: usize, mtu: u16) -> usize {
+    socket_max
+        .min(MAX_TRANSMIT_SEGMENTS)
+        .min(MAX_TRANSMIT_BYTES / usize::from(mtu).max(1))
+        .max(1)
+}
