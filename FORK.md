@@ -109,19 +109,37 @@ minor line (0.12) is a merge of that line, done when sail moves its
 
 ## Ahead of the release
 
-`quinn` is 0.11.12 with four upstream fixes from the `0.11.x` line that
-no release on crates.io has yet (upstream commits, as merged here):
+The crates are the `0.11.x` line's tip as of 2026-10-22, past the latest
+releases on crates.io (upstream commits, as merged here):
 
-- `bcd86796`, `handshake_data` is cancellation-safe: retrying it after a
-  dropped call no longer panics.
-- `12d7f077`, a connection whose transmit fails is closed and its state
-  cleaned up before the error is returned.
-- `16ecc700`, a finished stream's waker is removed from
-  `blocked_readers` instead of going stale there.
-- `f97fb5aa`, `wait_idle` wakes when the endpoint driver is dropped
-  (backport of upstream #2901).
-
-`quinn-udp` is 0.5.16 as released, but for one line of a test.
+- `quinn` is 0.11.12 and these fixes:
+  - `bcd86796`, `handshake_data` is cancellation-safe: retrying it after
+    a dropped call no longer panics.
+  - `12d7f077`, a connection whose transmit fails is closed and its
+    state cleaned up before the error is returned.
+  - `16ecc700`, a finished stream's waker is removed from
+    `blocked_readers` instead of going stale there.
+  - `f97fb5aa`, `wait_idle` wakes when the endpoint driver is dropped
+    (backport of upstream #2901).
+  - `c6d94ce4`, no handshake starts once the endpoint driver is gone.
+  - `6e5b60d9`, accepting releases the endpoint lock while TLS is set up.
+  - `8675d095`, ignored receive errors count toward the receive budget.
+- `quinn-proto` is 0.11.19 and these fixes:
+  - `50f5519c`, an illegal ordered read leaves the receive state as it
+    was.
+  - `5303ccc1`, switching a stream to unordered drops duplicates of
+    what was already read.
+  - `e716bf53`, a disabled idle timeout is honoured when accepting.
+  - `9ba03eb5`, transport parameters in nonminimal integer encodings
+    are accepted.
+  - `e367976e`, only a datagram frame larger than the advertised limit
+    is a protocol violation; one that fits it but not the receive
+    buffer's memory is dropped.
+  - `98c9372f`, a close reason is cut to fit the error code's width.
+  - `5aebe8f7` and the commits before it, acceptance in three phases,
+    which `6e5b60d9` builds on.
+- `quinn-udp` is 0.5.16 and `b86fc003` (`IPV6_V6ONLY` is queried only on
+  IPv6 sockets), and one line of a test.
 
 ## When it could go away
 
