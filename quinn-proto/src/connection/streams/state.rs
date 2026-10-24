@@ -256,9 +256,7 @@ impl StreamsState {
                 let id = StreamId::new(self.side, dir, i);
                 self.send.remove(&id).unwrap();
                 if let Dir::Bi = dir {
-                    if let Some(recv) = self.recv.remove(&id).unwrap() {
-                        self.give_back(recv_granted(&recv, self.stream_receive_window));
-                    }
+                    self.recv.remove(&id).unwrap();
                 }
             }
             self.next[dir as usize] = 0;
@@ -1014,10 +1012,9 @@ impl StreamsState {
         {
             return;
         }
+        // Not asked of the budget: what all streams hold together is bounded
+        // by the connection's window, which is.
         let window = rs.window.saturating_mul(2).min(max);
-        if !self.take(window - rs.window) {
-            return;
-        }
         rs.window = window;
         // As quic-go's: room for the stream, and half as much for the others.
         self.ensure_receive_window(window.saturating_add(window / 2));
@@ -1059,13 +1056,18 @@ impl StreamsState {
         if target <= self.receive_window {
             return;
         }
-        let grow = target - self.receive_window;
-        if !self.take(grow) {
-            return;
+        // Near the end of the budget, a step it cannot give is halved until it can, so that the
+        // window takes what is left rather than nothing.
+        let mut grow = target - self.receive_window;
+        while !self.take(grow) {
+            grow /= 2;
+            if grow < MIN_GROWTH {
+                return;
+            }
         }
         self.receive_granted += grow;
         self.local_max_data = self.local_max_data.saturating_add(grow);
-        self.receive_window = target;
+        self.receive_window += grow;
     }
 
     /// Takes `bytes` of window growth from the budget, if there is one
@@ -1168,7 +1170,6 @@ impl StreamsState {
     }
 
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
-        self.give_back(recv_granted(&recv, self.stream_receive_window));
         self.free_recv.push(recv.free(self.stream_receive_window));
         self.stream_freed(id, StreamHalf::Recv);
     }
@@ -1187,22 +1188,12 @@ impl StreamsState {
 
 impl Drop for StreamsState {
     fn drop(&mut self) {
-        let open = self
-            .recv
-            .values()
-            .flatten()
-            .map(|recv| recv_granted(recv, self.stream_receive_window))
-            .sum::<u64>();
-        self.give_back(open + self.receive_granted + self.send_granted);
+        self.give_back(self.receive_granted + self.send_granted);
     }
 }
 
-/// What a stream's receive window has grown by past `initial`
-fn recv_granted(recv: &StreamRecv, initial: u64) -> u64 {
-    match recv {
-        StreamRecv::Free(r) | StreamRecv::Open(r) => r.window.saturating_sub(initial),
-    }
-}
+/// The smallest step a connection's receive window grows by when the budget is short
+const MIN_GROWTH: u64 = 16 * 1024;
 
 /// Whether a window of which `read` bytes were read in `elapsed` was read fast enough to grow:
 /// the share read took less than four times as long as that share of a round trip, quic-go's test
@@ -1342,9 +1333,11 @@ mod tests {
         }
         assert_eq!(window, 1024 * KIB);
         assert!(client.receive_window >= 1536 * KIB);
+        // Only the connection's growth is asked of the budget: what streams hold
+        // together cannot pass the connection's window.
         assert_eq!(
             *budget.held.lock().unwrap(),
-            (window - 64 * KIB) + (client.receive_window - 96 * KIB)
+            client.receive_window - 96 * KIB
         );
     }
 
@@ -1373,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn growth_stops_at_the_budget_and_is_given_back() {
+    fn the_connection_window_stops_at_the_budget_and_is_given_back() {
         let budget = std::sync::Arc::new(Counted {
             limit: 64 * KIB,
             held: Default::default(),
@@ -1385,31 +1378,20 @@ mod tests {
         let (mut offset, mut window) = (0, 64 * KIB);
         for _ in 0..40 {
             client.tick(now, rtt, 0);
-            let len = window * 3 / 4;
+            // As much as both windows let the peer send.
+            let room = client.local_max_data - client.data_recvd;
+            let len = (window * 3 / 4).min(room);
             window = deliver_and_read(&mut client, id, offset, len);
             offset += len;
             now += Duration::from_millis(1);
         }
-        // 64 KiB of budget: one doubling of the stream, none of the connection.
-        assert_eq!(window, 128 * KIB);
-        assert_eq!(*budget.held.lock().unwrap(), 64 * KIB);
-        // A reset stream is freed, and what it grew by goes back.
-        let _ = client
-            .received_reset(frame::ResetStream {
-                id,
-                error_code: 0u32.into(),
-                final_offset: VarInt::from_u64(offset).unwrap(),
-            })
-            .unwrap();
-        let mut pending = Retransmits::default();
-        let mut recv = RecvStream {
-            id,
-            state: &mut client,
-            pending: &mut pending,
-        };
-        let mut chunks = recv.read(true).unwrap();
-        assert!(chunks.next(usize::MAX).is_err());
-        let _ = chunks.finalize();
+        // 64 KiB of budget: the connection's 96 KiB window takes most of it in halved steps,
+        // and never more.
+        let grown = client.receive_window - 96 * KIB;
+        assert!((32 * KIB..=64 * KIB).contains(&grown), "{}", grown);
+        assert_eq!(*budget.held.lock().unwrap(), grown);
+        assert!(window > 64 * KIB);
+        drop(client);
         assert_eq!(*budget.held.lock().unwrap(), 0);
     }
 

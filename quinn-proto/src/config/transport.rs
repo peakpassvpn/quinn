@@ -397,8 +397,9 @@ impl TransportConfig {
 /// The send window is twice the congestion window, between the configured `send_window` and
 /// `send_window_max`: what a sender needs in flight, and no more held for a slow path.
 ///
-/// Every growth past the configured sizes is asked of the budget first, if there is one, and
-/// given back when the stream or connection is freed.
+/// The connection's receive window and the send window bound what a connection holds, so their
+/// growth past the configured sizes is asked of the budget first, if there is one, and given
+/// back when the connection is freed; stream windows, within the connection's, grow freely.
 #[derive(Clone)]
 pub struct WindowTuning {
     pub(crate) stream_receive_window_max: u64,
