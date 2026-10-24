@@ -369,6 +369,8 @@ impl Connection {
         if path_validated {
             this.on_path_validated();
         }
+        this.streams
+            .set_window_tuning(this.config.window_tuning.clone());
         if side.is_client() {
             // Kick off the connection
             this.write_crypto();
@@ -470,6 +472,7 @@ impl Connection {
             false => 1,
             true => max_datagrams,
         };
+        self.tick_streams(now);
 
         let mut num_datagrams = 0;
         // Position in `buf` of the first byte of the current UDP datagram. When coalescing QUIC
@@ -1139,6 +1142,7 @@ impl Connection {
                 first_decode,
                 remaining,
             }) => {
+                self.tick_streams(now);
                 // If this packet could initiate a migration and we're a client or a server that
                 // forbids migration, drop the datagram. This could be relaxed to heuristically
                 // permit NAT-rebinding-like migration.
@@ -1202,6 +1206,7 @@ impl Connection {
     /// `Instant` that was output by `poll_timeout`; however spurious extra calls will simply
     /// no-op and therefore are safe.
     pub fn handle_timeout(&mut self, now: Instant) {
+        self.tick_streams(now);
         for &timer in &Timer::VALUES {
             if !self.timers.is_expired(timer, now) {
                 continue;
@@ -1462,6 +1467,12 @@ impl Connection {
     /// decrement by one for each time a remotely initiated stream of matching directionality is closed.
     pub fn max_concurrent_streams(&self, dir: Dir) -> u64 {
         self.streams.max_concurrent(dir)
+    }
+
+    /// Gives the streams the time, smoothed RTT and congestion window their windows follow
+    fn tick_streams(&mut self, now: Instant) {
+        self.streams
+            .tick(now, self.path.rtt.get(), self.path.congestion.window());
     }
 
     /// See [`TransportConfig::send_window()`]

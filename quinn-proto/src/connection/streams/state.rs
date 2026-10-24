@@ -13,7 +13,7 @@ use super::{
     StreamHalf, ThinRetransmits,
 };
 use crate::{
-    Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
+    Dir, Duration, Instant, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt, WindowTuning,
     coding::BufMutExt,
     connection::stats::FrameStats,
     frame::{self, FrameStruct, StreamMetaVec},
@@ -141,6 +141,21 @@ pub struct StreamsState {
     ///
     /// A new frame is only queued once the peer has raised the limit.
     pub(super) data_blocked_limit: Option<u64>,
+
+    /// How windows grow, if they do
+    tuning: Option<WindowTuning>,
+    /// The send window as configured, which `send_window` grows from
+    send_window_base: u64,
+    /// The latest time and smoothed RTT the connection has seen, for window growth
+    clock: Option<(Instant, Duration)>,
+    /// What `receive_window` has grown by, taken from the budget
+    receive_granted: u64,
+    /// What `send_window` is above `send_window_base`, taken from the budget
+    send_granted: u64,
+    /// Since when, and from which total, reads count towards the connection window's next growth
+    epoch: Option<(Instant, u64)>,
+    /// Bytes read from all streams
+    bytes_read: u64,
 }
 
 impl StreamsState {
@@ -186,6 +201,13 @@ impl StreamsState {
             initial_max_stream_data_bidi_remote: 0u32.into(),
             receive_window_shrink_debt: 0,
             data_blocked_limit: None,
+            tuning: None,
+            send_window_base: send_window,
+            clock: None,
+            receive_granted: 0,
+            send_granted: 0,
+            epoch: None,
+            bytes_read: 0,
         };
 
         for dir in Dir::iter() {
@@ -234,7 +256,9 @@ impl StreamsState {
                 let id = StreamId::new(self.side, dir, i);
                 self.send.remove(&id).unwrap();
                 if let Dir::Bi = dir {
-                    self.recv.remove(&id).unwrap();
+                    if let Some(recv) = self.recv.remove(&id).unwrap() {
+                        self.give_back(recv_granted(&recv, self.stream_receive_window));
+                    }
                 }
             }
             self.next[dir as usize] = 0;
@@ -529,7 +553,7 @@ impl StreamsState {
             }
             retransmits.get_or_create().max_stream_data.insert(id);
 
-            let (max, _) = rs.max_stream_data(self.stream_receive_window);
+            let (max, _) = rs.max_stream_data();
             rs.record_sent_max_stream_data(max);
 
             trace!(stream = %id, max = max, "MAX_STREAM_DATA");
@@ -931,7 +955,135 @@ impl StreamsState {
     }
 
     pub(crate) fn set_send_window(&mut self, send_window: u64) {
-        self.send_window = send_window;
+        self.send_window_base = send_window;
+        self.send_window = send_window + self.send_granted;
+    }
+
+    /// Makes windows grow as `tuning` says, from the sizes given at construction
+    pub(crate) fn set_window_tuning(&mut self, tuning: Option<WindowTuning>) {
+        self.tuning = tuning;
+    }
+
+    /// The connection's latest time, smoothed RTT and congestion window
+    ///
+    /// Window growth is judged against the first two; the send window follows the third.
+    pub(crate) fn tick(&mut self, now: Instant, rtt: Duration, cwnd: u64) {
+        self.clock = Some((now, rtt));
+        let Some(max) = self.tuning.as_ref().map(|t| t.send_window_max) else {
+            return;
+        };
+        let max = max.max(self.send_window_base);
+        let wanted =
+            cwnd.saturating_mul(2).clamp(self.send_window_base, max) - self.send_window_base;
+        if wanted > self.send_granted {
+            if self.take(wanted - self.send_granted) {
+                self.send_granted = wanted;
+            }
+        } else {
+            self.give_back(self.send_granted - wanted);
+            self.send_granted = wanted;
+        }
+        self.send_window = self.send_window_base + self.send_granted;
+    }
+
+    /// Doubles a stream's receive window if it was read about as fast as data arrived
+    pub(super) fn grow_stream_window(&mut self, rs: &mut Recv) {
+        let (Some(max), Some((now, rtt))) = (
+            self.tuning.as_ref().map(|t| t.stream_receive_window_max),
+            self.clock,
+        ) else {
+            return;
+        };
+        let read = rs.assembler.bytes_read();
+        let Some((start, offset)) = rs.epoch else {
+            rs.epoch = Some((now, read));
+            return;
+        };
+        let in_epoch = read - offset;
+        if in_epoch <= rs.window / 2 {
+            return;
+        }
+        rs.epoch = Some((now, read));
+        if rs.window >= max
+            || !grows(
+                now.saturating_duration_since(start),
+                in_epoch,
+                rs.window,
+                rtt,
+            )
+        {
+            return;
+        }
+        let window = rs.window.saturating_mul(2).min(max);
+        if !self.take(window - rs.window) {
+            return;
+        }
+        rs.window = window;
+        // As quic-go's: room for the stream, and half as much for the others.
+        self.ensure_receive_window(window.saturating_add(window / 2));
+    }
+
+    /// Doubles the connection's receive window if all its streams together were read about
+    /// as fast as data arrived
+    fn grow_receive_window(&mut self) {
+        let (Some(_), Some((now, rtt))) = (&self.tuning, self.clock) else {
+            return;
+        };
+        let read = self.bytes_read;
+        let Some((start, offset)) = self.epoch else {
+            self.epoch = Some((now, read));
+            return;
+        };
+        let in_epoch = read - offset;
+        if in_epoch <= self.receive_window / 2 {
+            return;
+        }
+        self.epoch = Some((now, read));
+        if grows(
+            now.saturating_duration_since(start),
+            in_epoch,
+            self.receive_window,
+            rtt,
+        ) {
+            self.ensure_receive_window(self.receive_window.saturating_mul(2));
+        }
+    }
+
+    /// Grows the connection's receive window to `min`, or as far towards it as its maximum
+    /// and the budget allow
+    fn ensure_receive_window(&mut self, min: u64) {
+        let Some(max) = self.tuning.as_ref().map(|t| t.receive_window_max) else {
+            return;
+        };
+        let target = min.min(max);
+        if target <= self.receive_window {
+            return;
+        }
+        let grow = target - self.receive_window;
+        if !self.take(grow) {
+            return;
+        }
+        self.receive_granted += grow;
+        self.local_max_data = self.local_max_data.saturating_add(grow);
+        self.receive_window = target;
+    }
+
+    /// Takes `bytes` of window growth from the budget, if there is one
+    fn take(&self, bytes: u64) -> bool {
+        match self.tuning.as_ref().and_then(|t| t.budget.as_ref()) {
+            Some(budget) => budget.try_grow(bytes),
+            None => true,
+        }
+    }
+
+    /// Gives `bytes` of window growth back to the budget
+    fn give_back(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(budget) = self.tuning.as_ref().and_then(|t| t.budget.as_ref()) {
+            budget.release(bytes);
+        }
     }
 
     /// Set the receive_window and returns whether the receive_window has been
@@ -974,6 +1126,8 @@ impl StreamsState {
     /// suppress sending further updates until the window increases significantly
     /// again.
     pub(super) fn add_read_credits(&mut self, credits: u64) -> ShouldTransmit {
+        self.bytes_read = self.bytes_read.saturating_add(credits);
+        self.grow_receive_window();
         if credits > self.receive_window_shrink_debt {
             let net_credits = credits - self.receive_window_shrink_debt;
             self.local_max_data = self.local_max_data.saturating_add(net_credits);
@@ -1014,6 +1168,7 @@ impl StreamsState {
     }
 
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
+        self.give_back(recv_granted(&recv, self.stream_receive_window));
         self.free_recv.push(recv.free(self.stream_receive_window));
         self.stream_freed(id, StreamHalf::Recv);
     }
@@ -1028,6 +1183,31 @@ impl StreamsState {
             Dir::Bi => self.initial_max_stream_data_bidi_remote,
         }
     }
+}
+
+impl Drop for StreamsState {
+    fn drop(&mut self) {
+        let open = self
+            .recv
+            .values()
+            .flatten()
+            .map(|recv| recv_granted(recv, self.stream_receive_window))
+            .sum::<u64>();
+        self.give_back(open + self.receive_granted + self.send_granted);
+    }
+}
+
+/// What a stream's receive window has grown by past `initial`
+fn recv_granted(recv: &StreamRecv, initial: u64) -> u64 {
+    match recv {
+        StreamRecv::Free(r) | StreamRecv::Open(r) => r.window.saturating_sub(initial),
+    }
+}
+
+/// Whether a window of which `read` bytes were read in `elapsed` was read fast enough to grow:
+/// the share read took less than four times as long as that share of a round trip, quic-go's test
+fn grows(elapsed: Duration, read: u64, window: u64, rtt: Duration) -> bool {
+    !rtt.is_zero() && elapsed.as_secs_f64() < 4.0 * read as f64 / window as f64 * rtt.as_secs_f64()
 }
 
 #[inline]
@@ -1060,6 +1240,202 @@ mod tests {
         connection::State as ConnState, connection::Streams,
     };
     use bytes::Bytes;
+
+    /// A budget of `limit` bytes that counts what is held
+    struct Counted {
+        limit: u64,
+        held: std::sync::Mutex<u64>,
+    }
+
+    impl crate::WindowBudget for Counted {
+        fn try_grow(&self, bytes: u64) -> bool {
+            let mut held = self.held.lock().unwrap();
+            if *held + bytes > self.limit {
+                return false;
+            }
+            *held += bytes;
+            true
+        }
+        fn release(&self, bytes: u64) {
+            *self.held.lock().unwrap() -= bytes;
+        }
+    }
+
+    const KIB: u64 = 1024;
+
+    /// A client whose stream windows start at 64 KiB and may grow to 1 MiB, its connection's
+    /// from 96 KiB to 4 MiB, its send window from 64 KiB to 1 MiB, within `budget`
+    fn tuned(budget: &std::sync::Arc<Counted>) -> StreamsState {
+        let mut client = StreamsState::new(
+            Side::Client,
+            128u32.into(),
+            128u32.into(),
+            64 * KIB,
+            VarInt::from_u64(96 * KIB).unwrap(),
+            VarInt::from_u64(64 * KIB).unwrap(),
+        );
+        client.set_window_tuning(Some(
+            WindowTuning::new(
+                VarInt::from_u64(1024 * KIB).unwrap(),
+                VarInt::from_u64(4096 * KIB).unwrap(),
+                1024 * KIB,
+            )
+            .budget(budget.clone()),
+        ));
+        client
+    }
+
+    /// Receives `len` bytes on `id` at `offset` and reads them all, as a connection would:
+    /// what the reads let the peer send is recorded as sent. Returns the stream's window.
+    fn deliver_and_read(state: &mut StreamsState, id: StreamId, offset: u64, len: u64) -> u64 {
+        let _ = state
+            .received(
+                frame::Stream {
+                    id,
+                    offset,
+                    fin: false,
+                    data: Bytes::from(vec![0; len as usize]),
+                },
+                len as usize,
+            )
+            .unwrap();
+        let mut pending = Retransmits::default();
+        let mut recv = RecvStream {
+            id,
+            state: &mut *state,
+            pending: &mut pending,
+        };
+        let mut chunks = recv.read(true).unwrap();
+        while let Ok(Some(_)) = chunks.next(usize::MAX) {}
+        let _ = chunks.finalize();
+        let rs = state
+            .recv
+            .get_mut(&id)
+            .and_then(|s| s.as_mut())
+            .and_then(|s| s.as_open_recv_mut())
+            .unwrap();
+        let (max, _) = rs.max_stream_data();
+        rs.record_sent_max_stream_data(max);
+        let window = rs.window;
+        state.sent_max_data = VarInt::try_from(state.local_max_data).unwrap_or(VarInt::MAX);
+        window
+    }
+
+    #[test]
+    fn a_window_read_as_fast_as_data_arrives_grows() {
+        let budget = std::sync::Arc::new(Counted {
+            limit: u64::MAX,
+            held: Default::default(),
+        });
+        let mut client = tuned(&budget);
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let rtt = Duration::from_millis(100);
+        let mut now = Instant::now();
+        let (mut offset, mut window) = (0, 64 * KIB);
+        for _ in 0..40 {
+            client.tick(now, rtt, 0);
+            // Most of a window each millisecond: far faster than a round trip.
+            let len = window * 3 / 4;
+            window = deliver_and_read(&mut client, id, offset, len);
+            offset += len;
+            now += Duration::from_millis(1);
+        }
+        assert_eq!(window, 1024 * KIB);
+        assert!(client.receive_window >= 1536 * KIB);
+        assert_eq!(
+            *budget.held.lock().unwrap(),
+            (window - 64 * KIB) + (client.receive_window - 96 * KIB)
+        );
+    }
+
+    #[test]
+    fn a_window_read_slowly_stays() {
+        let budget = std::sync::Arc::new(Counted {
+            limit: u64::MAX,
+            held: Default::default(),
+        });
+        let mut client = tuned(&budget);
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let rtt = Duration::from_millis(10);
+        let mut now = Instant::now();
+        let mut offset = 0;
+        for _ in 0..20 {
+            client.tick(now, rtt, 0);
+            assert_eq!(
+                deliver_and_read(&mut client, id, offset, 48 * KIB),
+                64 * KIB
+            );
+            offset += 48 * KIB;
+            // Each window's worth takes a second, a hundred round trips.
+            now += Duration::from_secs(1);
+        }
+        assert_eq!(*budget.held.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn growth_stops_at_the_budget_and_is_given_back() {
+        let budget = std::sync::Arc::new(Counted {
+            limit: 64 * KIB,
+            held: Default::default(),
+        });
+        let mut client = tuned(&budget);
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let rtt = Duration::from_millis(100);
+        let mut now = Instant::now();
+        let (mut offset, mut window) = (0, 64 * KIB);
+        for _ in 0..40 {
+            client.tick(now, rtt, 0);
+            let len = window * 3 / 4;
+            window = deliver_and_read(&mut client, id, offset, len);
+            offset += len;
+            now += Duration::from_millis(1);
+        }
+        // 64 KiB of budget: one doubling of the stream, none of the connection.
+        assert_eq!(window, 128 * KIB);
+        assert_eq!(*budget.held.lock().unwrap(), 64 * KIB);
+        // A reset stream is freed, and what it grew by goes back.
+        let _ = client
+            .received_reset(frame::ResetStream {
+                id,
+                error_code: 0u32.into(),
+                final_offset: VarInt::from_u64(offset).unwrap(),
+            })
+            .unwrap();
+        let mut pending = Retransmits::default();
+        let mut recv = RecvStream {
+            id,
+            state: &mut client,
+            pending: &mut pending,
+        };
+        let mut chunks = recv.read(true).unwrap();
+        assert!(chunks.next(usize::MAX).is_err());
+        let _ = chunks.finalize();
+        assert_eq!(*budget.held.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn the_send_window_follows_the_congestion_window() {
+        let budget = std::sync::Arc::new(Counted {
+            limit: 512 * KIB,
+            held: Default::default(),
+        });
+        let mut client = tuned(&budget);
+        let now = Instant::now();
+        let rtt = Duration::from_millis(50);
+        // Twice the congestion window, but never below the configured 64 KiB.
+        client.tick(now, rtt, 16 * KIB);
+        assert_eq!(client.send_window, 64 * KIB);
+        client.tick(now, rtt, 128 * KIB);
+        assert_eq!(client.send_window, 256 * KIB);
+        // Past the budget it stays where it was.
+        client.tick(now, rtt, 512 * KIB);
+        assert_eq!(client.send_window, 256 * KIB);
+        client.tick(now, rtt, 64 * KIB);
+        assert_eq!(client.send_window, 128 * KIB);
+        assert_eq!(*budget.held.lock().unwrap(), 64 * KIB);
+        drop(client);
+        assert_eq!(*budget.held.lock().unwrap(), 0);
+    }
 
     fn make(side: Side) -> StreamsState {
         StreamsState::new(

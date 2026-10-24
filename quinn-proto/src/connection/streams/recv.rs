@@ -8,7 +8,7 @@ use super::state::get_or_insert_recv;
 use super::{ClosedStream, Retransmits, ShouldTransmit, StreamId, StreamsState};
 use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
 use crate::connection::streams::state::StreamRecv;
-use crate::{TransportError, VarInt, frame};
+use crate::{Instant, TransportError, VarInt, frame};
 
 #[derive(Debug, Default)]
 pub(super) struct Recv {
@@ -18,6 +18,11 @@ pub(super) struct Recv {
     sent_max_stream_data: u64,
     pub(super) end: u64,
     pub(super) stopped: bool,
+    /// How much the peer may send ahead of what is read: the configured stream receive window,
+    /// or more once it has grown
+    pub(super) window: u64,
+    /// Since when, and from which offset, reads count towards the window's next growth
+    pub(super) epoch: Option<(Instant, u64)>,
 }
 
 impl Recv {
@@ -28,6 +33,8 @@ impl Recv {
             sent_max_stream_data: initial_max_data,
             end: 0,
             stopped: false,
+            window: initial_max_data,
+            epoch: None,
         })
     }
 
@@ -38,6 +45,8 @@ impl Recv {
         self.sent_max_stream_data = initial_max_data;
         self.end = 0;
         self.stopped = false;
+        self.window = initial_max_data;
+        self.epoch = None;
     }
 
     /// Process a STREAM frame
@@ -109,7 +118,8 @@ impl Recv {
     /// transmission of the value is recommended. If the boolean value is
     /// `false` the new window should only be transmitted if a previous transmission
     /// had failed.
-    pub(super) fn max_stream_data(&mut self, stream_receive_window: u64) -> (u64, ShouldTransmit) {
+    pub(super) fn max_stream_data(&mut self) -> (u64, ShouldTransmit) {
+        let stream_receive_window = self.window;
         let max_stream_data = self.assembler.bytes_read() + stream_receive_window;
 
         // Only announce a window update if it's significant enough
@@ -361,7 +371,8 @@ impl<'a> Chunks<'a> {
 
         // If the stream hasn't finished, we may need to issue stream-level flow control credit
         if let ChunksState::Readable(mut rs) = state {
-            let (_, max_stream_data) = rs.max_stream_data(self.streams.stream_receive_window);
+            self.streams.grow_stream_window(&mut rs);
+            let (_, max_stream_data) = rs.max_stream_data();
             should_transmit |= max_stream_data.0;
             if max_stream_data.0 {
                 self.pending.max_stream_data.insert(self.id);
@@ -482,7 +493,7 @@ mod tests {
             "full connection flow control credit is issued by stop"
         );
 
-        let (max_stream_data, transmit) = s.max_stream_data(RECV_WINDOW);
+        let (max_stream_data, transmit) = s.max_stream_data();
         assert!(!transmit.should_transmit());
         assert_eq!(
             max_stream_data, RECV_WINDOW,
@@ -507,7 +518,7 @@ mod tests {
         assert_eq!(new_bytes, RECV_WINDOW - (INITIAL_OFFSET + INITIAL_BYTES));
         assert!(!is_closed);
 
-        let (max_stream_data, transmit) = s.max_stream_data(RECV_WINDOW);
+        let (max_stream_data, transmit) = s.max_stream_data();
         assert!(!transmit.should_transmit());
         assert_eq!(
             max_stream_data, RECV_WINDOW,
@@ -534,7 +545,7 @@ mod tests {
         );
         assert!(!is_closed);
 
-        let (max_stream_data, transmit) = s.max_stream_data(RECV_WINDOW);
+        let (max_stream_data, transmit) = s.max_stream_data();
         assert!(!transmit.should_transmit());
         assert_eq!(
             max_stream_data, RECV_WINDOW,

@@ -31,6 +31,7 @@ pub struct TransportConfig {
     pub(crate) stream_receive_window: VarInt,
     pub(crate) receive_window: VarInt,
     pub(crate) send_window: u64,
+    pub(crate) window_tuning: Option<WindowTuning>,
     pub(crate) send_fairness: bool,
 
     pub(crate) packet_threshold: u32,
@@ -142,6 +143,16 @@ impl TransportConfig {
     /// retain more memory than this limit accounts for.
     pub fn send_window(&mut self, value: u64) -> &mut Self {
         self.send_window = value;
+        self
+    }
+
+    /// Windows that grow while they are read fast enough, from the configured ones up to the
+    /// maximums given, and the send window that follows the congestion window
+    ///
+    /// Without it (the default) every window stays at its configured size. With it,
+    /// `stream_receive_window`, `receive_window` and `send_window` are where windows start.
+    pub fn window_tuning(&mut self, value: Option<WindowTuning>) -> &mut Self {
+        self.window_tuning = value;
         self
     }
 
@@ -375,6 +386,68 @@ impl TransportConfig {
     }
 }
 
+/// How a connection's windows grow, and the budget they grow within
+///
+/// A stream's receive window doubles when more than half of it was read within four times
+/// that fraction of the smoothed RTT since its previous adjustment, as quic-go's do: data is
+/// read about as fast as it arrives, and the window, not the reader, holds the peer back. The
+/// connection's window is kept at 1.5 times its largest stream window at least, and grows by
+/// the same rule on what is read from all streams. Windows do not shrink while they are open.
+///
+/// The send window is twice the congestion window, between the configured `send_window` and
+/// `send_window_max`: what a sender needs in flight, and no more held for a slow path.
+///
+/// Every growth past the configured sizes is asked of the budget first, if there is one, and
+/// given back when the stream or connection is freed.
+#[derive(Clone)]
+pub struct WindowTuning {
+    pub(crate) stream_receive_window_max: u64,
+    pub(crate) receive_window_max: u64,
+    pub(crate) send_window_max: u64,
+    pub(crate) budget: Option<Arc<dyn WindowBudget>>,
+}
+
+impl WindowTuning {
+    /// The largest a stream's and a connection's receive window and the send window grow to
+    pub fn new(
+        stream_receive_window_max: VarInt,
+        receive_window_max: VarInt,
+        send_window_max: u64,
+    ) -> Self {
+        Self {
+            stream_receive_window_max: stream_receive_window_max.into(),
+            receive_window_max: receive_window_max.into(),
+            send_window_max,
+            budget: None,
+        }
+    }
+
+    /// The budget, shared by any number of connections, that window growth is asked of
+    pub fn budget(mut self, budget: Arc<dyn WindowBudget>) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+}
+
+impl fmt::Debug for WindowTuning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WindowTuning")
+            .field("stream_receive_window_max", &self.stream_receive_window_max)
+            .field("receive_window_max", &self.receive_window_max)
+            .field("send_window_max", &self.send_window_max)
+            .field("budget", &self.budget.is_some())
+            .finish()
+    }
+}
+
+/// Bytes that windows may grow by, shared by the connections given it
+pub trait WindowBudget: Send + Sync {
+    /// Takes `bytes` from the budget if it has them; a window grows only if this returns true
+    fn try_grow(&self, bytes: u64) -> bool;
+    /// Gives back `bytes` taken before
+    fn release(&self, bytes: u64);
+}
+
 impl Default for TransportConfig {
     fn default() -> Self {
         const EXPECTED_RTT: u32 = 100; // ms
@@ -391,6 +464,7 @@ impl Default for TransportConfig {
             stream_receive_window: STREAM_RWND.into(),
             receive_window: VarInt::MAX,
             send_window: (8 * STREAM_RWND).into(),
+            window_tuning: None,
             send_fairness: true,
 
             packet_threshold: 3,
@@ -430,6 +504,7 @@ impl fmt::Debug for TransportConfig {
             stream_receive_window,
             receive_window,
             send_window,
+            window_tuning,
             send_fairness,
             packet_threshold,
             time_threshold,
@@ -460,6 +535,7 @@ impl fmt::Debug for TransportConfig {
             .field("stream_receive_window", stream_receive_window)
             .field("receive_window", receive_window)
             .field("send_window", send_window)
+            .field("window_tuning", window_tuning)
             .field("send_fairness", send_fairness)
             .field("packet_threshold", packet_threshold)
             .field("time_threshold", time_threshold)
