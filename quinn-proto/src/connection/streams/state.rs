@@ -964,15 +964,25 @@ impl StreamsState {
 
     /// The connection's latest time, smoothed RTT and congestion window
     ///
-    /// Window growth is judged against the first two; the send window follows the third.
+    /// Window growth is judged against the first two. The send window follows the third: twice
+    /// the congestion window, or what the peer lets be outstanding, as far as that is
+    /// `SEND_WINDOW_TIME` of sending at the congestion window's rate.
     pub(crate) fn tick(&mut self, now: Instant, rtt: Duration, cwnd: u64) {
         self.clock = Some((now, rtt));
         let Some(max) = self.tuning.as_ref().map(|t| t.send_window_max) else {
             return;
         };
         let max = max.max(self.send_window_base);
-        let wanted =
-            cwnd.saturating_mul(2).clamp(self.send_window_base, max) - self.send_window_base;
+        let allowed = self
+            .max_data
+            .saturating_sub(self.data_sent.saturating_sub(self.buffered_data));
+        let rtt = rtt.max(SEND_WINDOW_MIN_RTT).as_micros() as u64;
+        let paced = (u128::from(cwnd) * SEND_WINDOW_TIME.as_micros() / u128::from(rtt)) as u64;
+        let wanted = cwnd
+            .saturating_mul(2)
+            .max(allowed.min(paced))
+            .clamp(self.send_window_base, max)
+            - self.send_window_base;
         if wanted > self.send_granted {
             if self.take(wanted - self.send_granted) {
                 self.send_granted = wanted;
@@ -1195,6 +1205,19 @@ impl Drop for StreamsState {
 /// The smallest step a connection's receive window grows by when the budget is short
 const MIN_GROWTH: u64 = 16 * 1024;
 
+/// How much sending the peer's allowance may hold the send window open for
+///
+/// At microseconds of RTT the congestion window is right but small, and a send window of twice
+/// it left uploads to a sing-box server 4-6% below the old estimator's, whose congestion window
+/// was hundreds of MB there; held at the peer's allowance they matched. The allowance alone,
+/// on each of a server's thousand slow connections, used up the budget and refused growth
+/// 0.1-4 million times; up to 20 ms of sending it used at most half and refused none
+/// (measured, sail#11).
+const SEND_WINDOW_TIME: Duration = Duration::from_millis(20);
+
+/// The least RTT the rate `SEND_WINDOW_TIME` is taken at is judged over, as BBR's BDP
+const SEND_WINDOW_MIN_RTT: Duration = Duration::from_millis(2);
+
 /// Whether a window of which `read` bytes were read in `elapsed` was read fast enough to grow:
 /// the share read took less than four times as long as that share of a round trip, quic-go's test
 fn grows(elapsed: Duration, read: u64, window: u64, rtt: Duration) -> bool {
@@ -1416,6 +1439,32 @@ mod tests {
         assert_eq!(client.send_window, 128 * KIB);
         assert_eq!(*budget.held.lock().unwrap(), 64 * KIB);
         drop(client);
+        assert_eq!(*budget.held.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn the_peer_s_allowance_holds_the_send_window_open_for_20_ms_of_sending() {
+        let budget = std::sync::Arc::new(Counted {
+            limit: u64::MAX,
+            held: Default::default(),
+        });
+        let mut client = tuned(&budget);
+        let now = Instant::now();
+        client.max_data = 4096 * KIB;
+        // At 100 µs, taken as 2 ms: 20 ms of a 16 KiB window's rate, not twice the window.
+        client.tick(now, Duration::from_micros(100), 16 * KIB);
+        assert_eq!(client.send_window, 160 * KIB);
+        // Never past the configured largest.
+        client.tick(now, Duration::from_micros(100), 128 * KIB);
+        assert_eq!(client.send_window, 1024 * KIB);
+        // Nor past what the peer allows.
+        client.max_data = 96 * KIB;
+        client.tick(now, Duration::from_micros(100), 16 * KIB);
+        assert_eq!(client.send_window, 96 * KIB);
+        // Where 20 ms is less than a round trip, the congestion window rules.
+        client.max_data = 4096 * KIB;
+        client.tick(now, Duration::from_millis(50), 16 * KIB);
+        assert_eq!(client.send_window, 64 * KIB);
         assert_eq!(*budget.held.lock().unwrap(), 0);
     }
 

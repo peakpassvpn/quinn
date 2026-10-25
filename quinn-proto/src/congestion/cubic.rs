@@ -2,7 +2,7 @@ use std::any::Any;
 use std::cmp;
 use std::sync::Arc;
 
-use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
+use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory, SpaceId};
 use crate::connection::RttEstimator;
 use crate::{Duration, Instant};
 
@@ -96,6 +96,8 @@ impl Controller for Cubic {
         now: Instant,
         sent: Instant,
         bytes: u64,
+        _pn: u64,
+        _space: SpaceId,
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
@@ -314,7 +316,15 @@ mod tests {
         // After ten days without a congestion event, w_cubic exceeds u64::MAX.
         // Before this fix, computing the window increment overflowed.
         let later = now + Duration::from_secs(10 * 24 * 60 * 60);
-        cubic.on_ack(later, later, BASE_DATAGRAM_SIZE, false, &rtt);
+        cubic.on_ack(
+            later,
+            later,
+            BASE_DATAGRAM_SIZE,
+            0,
+            SpaceId::Data,
+            false,
+            &rtt,
+        );
 
         assert_eq!(cubic.window, window + BASE_DATAGRAM_SIZE);
     }

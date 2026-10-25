@@ -11,7 +11,7 @@ use crate::congestion::bbr::min_max::MinMax;
 use crate::connection::RttEstimator;
 use crate::{Duration, Instant};
 
-use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
+use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory, SpaceId};
 
 mod bw_estimation;
 mod min_max;
@@ -264,7 +264,7 @@ impl Bbr {
 
     fn get_target_cwnd(&self, gain: f32) -> u64 {
         let bw = self.max_bandwidth.get_estimate();
-        let bdp = self.min_rtt.as_micros() as u64 * bw;
+        let bdp = self.min_rtt.max(MIN_BDP_RTT).as_micros() as u64 * bw;
         let bdpf = bdp as f64;
         let cwnd = ((gain as f64 * bdpf) / 1_000_000f64) as u64;
         // BDP estimate will be zero if no bandwidth samples are available yet.
@@ -393,21 +393,25 @@ impl Bbr {
 }
 
 impl Controller for Bbr {
-    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+    fn on_sent(&mut self, _now: Instant, _bytes: u64, last_packet_number: u64) {
         self.max_sent_packet_number = last_packet_number;
-        self.max_bandwidth.on_sent(now, bytes);
+    }
+
+    fn on_packet_sent(&mut self, now: Instant, _bytes: u16, packet_number: u64, space: SpaceId) {
+        self.max_bandwidth.on_packet_sent(now, packet_number, space);
     }
 
     fn on_ack(
         &mut self,
         now: Instant,
-        sent: Instant,
+        _sent: Instant,
         bytes: u64,
-        app_limited: bool,
+        pn: u64,
+        space: SpaceId,
+        _app_limited: bool,
         rtt: &RttEstimator,
     ) {
-        self.max_bandwidth
-            .on_ack(now, sent, bytes, self.round_count, app_limited);
+        self.max_bandwidth.on_ack(now, bytes, pn, space);
         self.acked_bytes += bytes;
         let sample = rtt.latest();
         self.ack_min_rtt = Some(self.ack_min_rtt.map_or(sample, |min| min.min(sample)));
@@ -419,6 +423,7 @@ impl Controller for Bbr {
         in_flight: u64,
         app_limited: bool,
         largest_packet_num_acked: Option<u64>,
+        space: SpaceId,
     ) {
         let bytes_acked = self.max_bandwidth.bytes_acked_this_window();
         let excess_acked = self.ack_aggregation.update_ack_aggregation_bytes(
@@ -427,7 +432,21 @@ impl Controller for Bbr {
             self.round_count,
             self.max_bandwidth.get_estimate(),
         );
-        self.max_bandwidth.end_acks(self.round_count, app_limited);
+        // A sample over less than the minimum RTT is not a rate; the minimum includes these
+        // ACKs' own RTT samples, so ACKs that lower it still take one.
+        let min_rtt = match self.ack_min_rtt {
+            Some(sample) if self.min_rtt.is_zero() => sample,
+            Some(sample) => sample.min(self.min_rtt),
+            None => self.min_rtt,
+        };
+        self.max_bandwidth.end_acks(
+            self.round_count,
+            app_limited,
+            in_flight,
+            largest_packet_num_acked,
+            space,
+            min_rtt,
+        );
         if let Some(largest_acked_packet) = largest_packet_num_acked {
             self.max_acked_packet_number = largest_acked_packet;
         }
@@ -486,6 +505,16 @@ impl Controller for Bbr {
         lost_bytes: u64,
     ) {
         self.loss_state.lost_bytes += lost_bytes;
+    }
+
+    fn on_packet_lost(
+        &mut self,
+        _lost_bytes: u16,
+        packet_number: u64,
+        space: SpaceId,
+        _now: Instant,
+    ) {
+        self.max_bandwidth.on_packet_lost(packet_number, space);
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
@@ -664,6 +693,18 @@ const PROBE_RTT_BASED_ON_BDP: bool = true;
 /// How long a minimum RTT is kept before a new sample replaces it, as quiche's kMinRttExpiry.
 const MIN_RTT_EXPIRY: Duration = Duration::from_secs(10);
 const DRAIN_TO_TARGET: bool = true;
+/// The least RTT the BDP is taken over
+///
+/// Where the minimum RTT is microseconds, a window of the BDP holds a few dozen KB while ACKs
+/// come back in batches: on an unshaped link, a minimum RTT of 11-45 µs and a smoothed one of
+/// 70-290 µs under load gave 17-82 KB of target, and the ack-aggregation allowance that
+/// quiche adds to it (`max_ack_height` over 10 rounds, as here) gave 0.2-0.9 MB. The window
+/// stayed at 0.3-0.9 MB, thousands of sends a transfer waited for it, and uploads ran 19-27%
+/// below the old estimator's. A 100-round filter still held it to 1-2 MB. From 0.5 ms no send
+/// waited for the window; 2 ms is what, with the send window's allowance (`StreamsState::tick`),
+/// kept every unshaped cell within 3% of the old estimator's. Paths of 2 ms or more are
+/// unchanged (measured, sail#11).
+const MIN_BDP_RTT: Duration = Duration::from_millis(2);
 
 #[cfg(test)]
 mod tests {
@@ -688,16 +729,79 @@ mod tests {
         let mut send_at = now;
         for _ in 0..packets {
             bbr.on_sent(send_at, packet_size, *pn);
+            bbr.on_packet_sent(send_at, packet_size as u16, *pn, SpaceId::Data);
             *pn += 1;
             send_at += spacing;
         }
         let mut ack_at = now + Duration::from_millis(20);
-        for _ in 0..packets {
-            bbr.on_ack(ack_at, now, packet_size, app_limited, rtt);
+        for acked in first..*pn {
+            bbr.on_ack(
+                ack_at,
+                now,
+                packet_size,
+                acked,
+                SpaceId::Data,
+                app_limited,
+                rtt,
+            );
             ack_at += spacing;
         }
-        bbr.on_end_acks(ack_at, 0, app_limited, Some(first + packets - 1));
+        bbr.on_end_acks(
+            ack_at,
+            0,
+            app_limited,
+            Some(first + packets - 1),
+            SpaceId::Data,
+        );
         ack_at
+    }
+
+    /// A flow paced at 12 MB/s over a 20 ms path, its receiver acknowledging every tenth packet:
+    /// the estimate is the link's rate. One ACK's bytes over the time since the last ACK read a
+    /// tenth of it.
+    #[test]
+    fn an_ack_of_many_packets_samples_the_link_rate() {
+        let start = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let rtt = RttEstimator::new(Duration::from_millis(20));
+        let spacing = Duration::from_micros(100);
+        let delay = Duration::from_millis(20);
+        let sent_at = |pn: u64| start + spacing * pn as u32;
+        let (mut acked, mut in_flight) = (0u64, 0u64);
+        for pn in 0..4000u64 {
+            // The ACKs that arrive before this packet is sent
+            while acked + 10 <= pn && sent_at(acked + 9) + delay <= sent_at(pn) {
+                let now = sent_at(acked + 9) + delay;
+                for number in acked..acked + 10 {
+                    bbr.on_ack(
+                        now,
+                        sent_at(number),
+                        1200,
+                        number,
+                        SpaceId::Data,
+                        false,
+                        &rtt,
+                    );
+                }
+                acked += 10;
+                in_flight -= 12_000;
+                bbr.on_end_acks(now, in_flight, false, Some(acked - 1), SpaceId::Data);
+            }
+            bbr.on_sent(sent_at(pn), 1200, pn);
+            bbr.on_packet_sent(sent_at(pn), 1200, pn, SpaceId::Data);
+            in_flight += 1200;
+        }
+        let estimate = bbr.max_bandwidth.get_estimate();
+        assert!(
+            (11_000_000..=13_000_000).contains(&estimate),
+            "estimate {estimate} B/s, link 12 MB/s"
+        );
+        // Every packet acknowledged or past the threshold is forgotten.
+        assert!(
+            bbr.max_bandwidth.tracked() <= 400,
+            "{}",
+            bbr.max_bandwidth.tracked()
+        );
     }
 
     #[test]
@@ -806,15 +910,16 @@ mod tests {
         let rtt = RttEstimator::new(Duration::from_millis(20));
         let mut pn = 0u64;
 
-        // Two fast seed rounds (120 MB/s samples): a large BDP-derived target,
-        // and too few non-growth rounds to trigger full-bandwidth detection.
+        // Two fast seed rounds (4000 packets 10 us apart, delivered in 60 ms:
+        // 80 MB/s samples): a large BDP-derived target, and too few
+        // non-growth rounds to trigger full-bandwidth detection.
         for _ in 0..2 {
             now = run_round(
                 &mut bbr,
                 &rtt,
                 now,
                 &mut pn,
-                33,
+                4000,
                 1200,
                 Duration::from_micros(10),
                 false,
@@ -852,7 +957,7 @@ mod tests {
     #[test]
     fn min_rtt_expires_when_the_path_gets_slower() {
         // One round trip of `rtt`: 33 packets sent 600 us apart, acked one
-        // RTT later at the same spacing (2 MB/s samples), not app-limited.
+        // RTT later at the same spacing, not app-limited.
         fn round(
             bbr: &mut Bbr,
             rtt: &RttEstimator,
@@ -865,15 +970,16 @@ mod tests {
             let mut send_at = now;
             for _ in 0..33 {
                 bbr.on_sent(send_at, 1200, *pn);
+                bbr.on_packet_sent(send_at, 1200, *pn, SpaceId::Data);
                 *pn += 1;
                 send_at += spacing;
             }
             let mut ack_at = now + delay;
-            for _ in 0..33 {
-                bbr.on_ack(ack_at, now, 1200, false, rtt);
+            for acked in first..*pn {
+                bbr.on_ack(ack_at, now, 1200, acked, SpaceId::Data, false, rtt);
                 ack_at += spacing;
             }
-            bbr.on_end_acks(ack_at, 0, false, Some(first + 32));
+            bbr.on_end_acks(ack_at, 0, false, Some(first + 32), SpaceId::Data);
             ack_at
         }
 
@@ -904,9 +1010,11 @@ mod tests {
             "min_rtt must follow the slower path, got {:?}",
             bbr.min_rtt
         );
-        // The delay-bandwidth product of the 150 ms path at the 2 MB/s the
+        // The delay-bandwidth product of the 150 ms path at the rate the
         // samples show.
-        let bdp = 2_000_000 * slow.as_millis() as u64 / 1000;
+        let bandwidth = bbr.max_bandwidth.get_estimate();
+        assert!(bandwidth > 0);
+        let bdp = bandwidth * slow.as_millis() as u64 / 1000;
         assert!(
             bbr.window() >= bdp,
             "the window must cover the 150 ms path's BDP ({bdp}), got {}",

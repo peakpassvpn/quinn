@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
+use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory, SpaceId};
 use crate::Instant;
 use crate::connection::RttEstimator;
 
@@ -46,6 +46,8 @@ impl Controller for NewReno {
         _now: Instant,
         sent: Instant,
         bytes: u64,
+        _pn: u64,
+        _space: SpaceId,
         app_limited: bool,
         _rtt: &RttEstimator,
     ) {

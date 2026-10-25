@@ -2,6 +2,7 @@
 
 use crate::Instant;
 use crate::connection::RttEstimator;
+pub use crate::packet::SpaceId;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -19,16 +20,26 @@ pub trait Controller: Send + Sync {
     #[allow(unused_variables)]
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {}
 
+    /// One ack-eliciting packet was just sent
+    ///
+    /// `packet_number` identifies the packet only within `space`; every packet number space
+    /// numbers independently from zero.
+    #[allow(unused_variables)]
+    fn on_packet_sent(&mut self, now: Instant, bytes: u16, packet_number: u64, space: SpaceId) {}
+
     /// Packet deliveries were confirmed
     ///
     /// `app_limited` indicates whether the connection was blocked on outgoing
     /// application data prior to receiving these acknowledgements.
+    /// `pn` identifies the packet only within `space`.
     #[allow(unused_variables)]
     fn on_ack(
         &mut self,
         now: Instant,
         sent: Instant,
         bytes: u64,
+        pn: u64,
+        space: SpaceId,
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
@@ -42,6 +53,7 @@ pub trait Controller: Send + Sync {
         in_flight: u64,
         app_limited: bool,
         largest_packet_num_acked: Option<u64>,
+        space: SpaceId,
     ) {
     }
 
@@ -58,6 +70,19 @@ pub trait Controller: Send + Sync {
         is_persistent_congestion: bool,
         lost_bytes: u64,
     );
+
+    /// One packet was just lost
+    ///
+    /// `packet_number` identifies the packet only within `space`.
+    #[allow(unused_variables)]
+    fn on_packet_lost(
+        &mut self,
+        lost_bytes: u16,
+        packet_number: u64,
+        space: SpaceId,
+        now: Instant,
+    ) {
+    }
 
     /// The known MTU for the current network path has been updated
     fn on_mtu_update(&mut self, new_mtu: u16);

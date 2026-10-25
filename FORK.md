@@ -34,8 +34,6 @@ minor line (0.12) is a merge of that line, done when sail moves its
   on one TUIC connection), and a sender could flood a bottleneck.
   It now grows while `cwnd < target_window`; the bandwidth filter takes
   app-limited samples only when they raise it, and no zero-rate ones.
-  A stopgap: the bandwidth sampling itself still reads low, which a
-  BBRv3 port (upstream #2481) is to replace.
 
 - **BBR's minimum RTT expires** (`quinn-proto`). BBR took the
   connection's lifetime minimum RTT (`RttEstimator::min`), which never
@@ -51,6 +49,41 @@ minor line (0.12) is a merge of that line, done when sail moves its
   replaces it and starts ProbeRtt, and leaving ProbeRtt stamps it anew.
   Upstream `main` still uses `rtt.min()`; the BBRv3 port (upstream
   #2481), which has a windowed min-RTT filter, is to replace this.
+
+- **BBR samples the delivery rate** (`quinn-proto`). BBR's bandwidth was
+  the bytes acked between two ACKs over the time between them, which
+  reads low when one ACK covers many packets and high when ACKs bunch.
+  As quiche's `BandwidthSampler` and Linux's `tcp_rate.c` take it
+  (draft-cheng-iccrg-delivery-rate-estimation), each ACK now gives one
+  sample from the newest packet it acknowledges: the bytes delivered
+  since that packet was sent, over the longer of the time it took to
+  send them and to acknowledge them, and none over less than the minimum
+  RTT. For that the controller is told of each packet sent and lost, and
+  of the number and space of each one acked (`Controller::on_packet_sent`,
+  `on_packet_lost`, and `on_ack` with upstream's arguments); `SpaceId`
+  is exported. Two allowances come with it, both measured on sail#11:
+  - The BDP is taken over at least 2 ms of RTT. At microseconds of RTT
+    the window of a right estimate is a few dozen KB, and quiche's
+    ack-aggregation allowance, which this BBR has, gave it no more than
+    0.9 MB while ACKs came in batches: uploads ran 19-27% below the old
+    estimator's.
+  - The send window, twice the congestion window, is held open up to
+    what the peer allows to be outstanding, but at most 20 ms of
+    sending at the congestion window's rate (over at least 2 ms of RTT).
+    Without it uploads at microseconds of RTT stayed 4-6% below; with
+    the peer's allowance alone, a server's thousand slow connections
+    used up the window budget.
+
+  With these, sail's Hysteria2 and TUIC at 150 and 300 ms RTT and at 2%
+  loss uploaded to a sing-box server at 1.07-1.23 times what a sing-box
+  client did, and between sail's own ends sent 1.19-2.5 times what
+  sing-box did between its own. No unshaped, 1% loss, reordering or
+  deep-queue cell lost more than 3% against the old estimator, but for
+  unshaped TUIC uploads to sing-box under a send window cap below 32
+  MiB, at 0.92-0.98 in four runs: the server's credit held both
+  estimators there alike, with the same bytes buffered and in flight.
+  Upstream `main` still has the old estimator; a BBRv3 port (upstream
+  #2481) would replace it.
 
 - **Up to 16 segments per send** (`quinn`). A connection handed the
   socket at most 10 datagrams per segmented send (`MAX_TRANSMIT_SEGMENTS`),
