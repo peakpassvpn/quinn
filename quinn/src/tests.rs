@@ -732,6 +732,129 @@ async fn wait_closed(conn: &crate::Connection) -> crate::ConnectionError {
         .unwrap()
 }
 
+/// A budget of `limit` bytes that keeps the most it held
+struct Held {
+    limit: u64,
+    held: Mutex<(u64, u64)>,
+}
+
+impl crate::WindowBudget for Held {
+    fn try_grow(&self, bytes: u64) -> bool {
+        let mut held = self.held.lock().unwrap();
+        if held.0 + bytes > self.limit {
+            return false;
+        }
+        held.0 += bytes;
+        held.1 = held.1.max(held.0);
+        true
+    }
+    fn release(&self, bytes: u64) {
+        self.held.lock().unwrap().0 -= bytes;
+    }
+}
+
+/// Four connections to one server, each with three uploads the server never reads and one it
+/// reads: with credit given on receipt out of a budget shared by the server's connections, the
+/// read uploads finish and what is lent never passes the budget (sail#18).
+async fn stalled_uploads(limit: u64) -> (u64, usize) {
+    const KIB: u64 = 1024;
+    let budget = Arc::new(Held {
+        limit,
+        held: Mutex::new((0, 0)),
+    });
+    let factory = EndpointFactory::new();
+    let mut transport = TransportConfig::default();
+    transport
+        .receive_window((96 * KIB as u32).into())
+        .stream_receive_window((64 * KIB as u32).into())
+        .window_tuning(Some(
+            crate::WindowTuning::new(
+                (64 * KIB as u32).into(),
+                (96 * KIB as u32).into(),
+                1024 * KIB,
+            )
+            .budget(budget.clone())
+            .credit_on_receipt(true),
+        ));
+    let server = factory.endpoint_with_config(transport);
+    let addr = server.local_addr().unwrap();
+    let accepting = server.clone();
+    tokio::spawn(async move {
+        while let Some(incoming) = accepting.accept().await {
+            let Ok(connection) = incoming.await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok(mut stream) = connection.accept_uni().await {
+                    // The first byte says whether the upload is read
+                    let mut kind = [0];
+                    if stream.read_exact(&mut kind).await.is_err() {
+                        return;
+                    }
+                    if kind[0] == 0 {
+                        held.push(stream);
+                    } else {
+                        tokio::spawn(async move {
+                            let _ = stream.read_to_end(usize::MAX).await;
+                        });
+                    }
+                }
+            });
+        }
+    });
+    let mut finished = 0;
+    let mut uploads = Vec::new();
+    for _ in 0..4 {
+        let client = factory.endpoint();
+        let connection = client.connect(addr, "localhost").unwrap().await.unwrap();
+        for _ in 0..3 {
+            let mut s = connection.open_uni().await.unwrap();
+            s.write_all(&[0]).await.unwrap();
+            let data = vec![0; 1 << 20];
+            tokio::spawn(async move {
+                let _ = s.write_all(&data).await;
+                std::future::pending::<()>().await;
+            });
+        }
+        // The stalled uploads' data on its way first
+        sleep(Duration::from_millis(200)).await;
+        uploads.push(tokio::spawn(async move {
+            let mut s = connection.open_uni().await.unwrap();
+            s.write_all(&[1]).await.unwrap();
+            s.write_all(&vec![0; 4 << 20]).await.unwrap();
+            s.finish().unwrap();
+            s.stopped().await.ok();
+            (client, connection)
+        }));
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    for upload in uploads {
+        if tokio::time::timeout_at(deadline, upload).await.is_ok() {
+            finished += 1;
+        }
+    }
+    let most = budget.held.lock().unwrap().1;
+    (most, finished)
+}
+
+#[tokio::test]
+async fn stalled_uploads_leave_the_others_flowing_within_the_budget() {
+    let _guard = subscribe();
+    // Room for every stalled window: 4 connections x 3 x 64 KiB
+    let (most, finished) = stalled_uploads(1024 * 1024).await;
+    assert_eq!(finished, 4);
+    assert!(most > 0 && most <= 1024 * 1024, "{most}");
+}
+
+#[tokio::test]
+async fn stalled_uploads_never_take_more_than_the_budget() {
+    let _guard = subscribe();
+    // Room for two of the twelve stalled windows
+    let (most, _) = stalled_uploads(128 * 1024).await;
+    assert!(most <= 128 * 1024, "{most}");
+}
+
 #[tokio::test]
 async fn zero_rtt() {
     let _guard = subscribe();

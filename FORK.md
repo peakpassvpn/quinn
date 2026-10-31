@@ -140,6 +140,19 @@ minor line (0.12) is a merge of that line, done when sail moves its
   under mimalloc, at 32 segments, it fell by about 15% within 20 s of
   the last download (one run).
 
+- **Connection credit on receipt** (`quinn-proto`), off unless
+  `WindowTuning::credit_on_receipt(true)` is set with a budget. Upstream,
+  like quic-go, Chromium and Envoy, gives connection-level credit
+  (MAX_DATA) back only as stream data is read. A stream nobody reads
+  holds up to its stream window of the connection's window, and two or
+  three such streams leave the others no credit at all (sail#18). With
+  the option, the credit for stream data is given as it arrives, lent out
+  of the window budget, and repaid as the stream is read, stopped, reset
+  or freed, or when the connection is dropped. A stalled stream then
+  holds its own window and no more. Where the budget refuses, credit
+  comes back on read as upstream's does. No reference implementation
+  does this; nothing changes on the wire.
+
 ## Ahead of the release
 
 The crates are the `0.11.x` line's tip as of 2026-10-22, past the latest

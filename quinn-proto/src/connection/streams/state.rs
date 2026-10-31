@@ -2,6 +2,7 @@ use std::{
     collections::{VecDeque, hash_map},
     convert::TryFrom,
     mem,
+    sync::Arc,
 };
 
 use bytes::BufMut;
@@ -13,7 +14,8 @@ use super::{
     StreamHalf, ThinRetransmits,
 };
 use crate::{
-    Dir, Duration, Instant, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt, WindowTuning,
+    Dir, Duration, Instant, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt, WindowBudget,
+    WindowTuning,
     coding::BufMutExt,
     connection::stats::FrameStats,
     frame::{self, FrameStruct, StreamMetaVec},
@@ -156,6 +158,8 @@ pub struct StreamsState {
     epoch: Option<(Instant, u64)>,
     /// Bytes read from all streams
     bytes_read: u64,
+    /// Connection-level credit lent to all streams' unread data, taken from the budget
+    lent: u64,
 }
 
 impl StreamsState {
@@ -208,6 +212,7 @@ impl StreamsState {
             send_granted: 0,
             epoch: None,
             bytes_read: 0,
+            lent: 0,
         };
 
         for dir in Dir::iter() {
@@ -288,6 +293,7 @@ impl StreamsState {
         self.validate_receive_id(id).inspect_err(|_e| {
             debug!("received illegal STREAM frame");
         })?;
+        let lender = self.lender();
 
         let rs = match self
             .recv
@@ -311,8 +317,17 @@ impl StreamsState {
         self.data_recvd = self.data_recvd.saturating_add(new_bytes);
 
         if !rs.stopped {
+            let lent = match lender {
+                Some(budget) if new_bytes > 0 && budget.try_grow(new_bytes) => new_bytes,
+                _ => 0,
+            };
+            rs.lent += lent;
             self.on_stream_frame(true, id);
-            return Ok(ShouldTransmit(false));
+            if lent == 0 {
+                return Ok(ShouldTransmit(false));
+            }
+            self.lent += lent;
+            return Ok(self.credit(lent));
         }
 
         // Stopped streams become closed instantly on FIN, so check whether we need to clean up
@@ -367,6 +382,8 @@ impl StreamsState {
         let bytes_read = rs.assembler.bytes_read();
         let stopped = rs.stopped;
         let end = rs.end;
+        // A reset stream's unread data is discarded, and with it what was lent for it
+        let lent = mem::take(&mut rs.lent);
         // Stopped streams have already returned read credits up to their highest offset.
         let credited = if stopped { end } else { bytes_read };
         if stopped {
@@ -382,8 +399,9 @@ impl StreamsState {
             self.data_recvd = self
                 .data_recvd
                 .saturating_add(u64::from(final_offset) - end);
-            self.add_read_credits(u64::from(final_offset) - credited)
+            self.read_credits(u64::from(final_offset) - credited, lent)
         } else {
+            self.repay(lent);
             ShouldTransmit(false)
         })
     }
@@ -1138,8 +1156,35 @@ impl StreamsState {
     /// suppress sending further updates until the window increases significantly
     /// again.
     pub(super) fn add_read_credits(&mut self, credits: u64) -> ShouldTransmit {
-        self.bytes_read = self.bytes_read.saturating_add(credits);
+        self.read_credits(credits, 0)
+    }
+
+    /// Counts `read` bytes as read from streams, `repaid` of which were lent credit on receipt:
+    /// that is given back to the budget, and the rest credited to the connection
+    pub(super) fn read_credits(&mut self, read: u64, repaid: u64) -> ShouldTransmit {
+        self.bytes_read = self.bytes_read.saturating_add(read);
         self.grow_receive_window();
+        self.repay(repaid);
+        self.credit(read.saturating_sub(repaid))
+    }
+
+    /// The budget to lend stream data connection-level credit from on receipt, if any
+    fn lender(&self) -> Option<Arc<dyn WindowBudget>> {
+        self.tuning
+            .as_ref()
+            .filter(|t| t.credit_on_receipt)
+            .and_then(|t| t.budget.clone())
+    }
+
+    /// Gives `bytes` of lent credit back to the budget
+    fn repay(&mut self, bytes: u64) {
+        debug_assert!(bytes <= self.lent);
+        self.lent -= bytes.min(self.lent);
+        self.give_back(bytes);
+    }
+
+    /// Adds `credits` to the connection's window
+    fn credit(&mut self, credits: u64) -> ShouldTransmit {
         if credits > self.receive_window_shrink_debt {
             let net_credits = credits - self.receive_window_shrink_debt;
             self.local_max_data = self.local_max_data.saturating_add(net_credits);
@@ -1179,7 +1224,11 @@ impl StreamsState {
         }
     }
 
-    pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
+    pub(super) fn stream_recv_freed(&mut self, id: StreamId, mut recv: StreamRecv) {
+        if let Some(rs) = recv.as_open_recv_mut() {
+            let lent = mem::take(&mut rs.lent);
+            self.repay(lent);
+        }
         self.free_recv.push(recv.free(self.stream_receive_window));
         self.stream_freed(id, StreamHalf::Recv);
     }
@@ -1198,7 +1247,7 @@ impl StreamsState {
 
 impl Drop for StreamsState {
     fn drop(&mut self) {
-        self.give_back(self.receive_granted + self.send_granted);
+        self.give_back(self.receive_granted + self.send_granted + self.lent);
     }
 }
 
@@ -1333,6 +1382,169 @@ mod tests {
         let window = rs.window;
         state.sent_max_data = VarInt::try_from(state.local_max_data).unwrap_or(VarInt::MAX);
         window
+    }
+
+    /// `tuned`, with connection-level credit given on receipt
+    fn lending(budget: &std::sync::Arc<Counted>) -> StreamsState {
+        let mut client = tuned(budget);
+        let tuning = client.tuning.take().map(|t| t.credit_on_receipt(true));
+        client.set_window_tuning(tuning);
+        client
+    }
+
+    fn budget_of(limit: u64) -> std::sync::Arc<Counted> {
+        std::sync::Arc::new(Counted {
+            limit,
+            held: Default::default(),
+        })
+    }
+
+    fn receive(
+        state: &mut StreamsState,
+        id: StreamId,
+        offset: u64,
+        len: u64,
+    ) -> Result<(), TransportError> {
+        state
+            .received(
+                frame::Stream {
+                    id,
+                    offset,
+                    fin: false,
+                    data: Bytes::from(vec![0; len as usize]),
+                },
+                len as usize,
+            )
+            .map(|_| ())
+    }
+
+    fn read_all(state: &mut StreamsState, id: StreamId) -> u64 {
+        let mut pending = Retransmits::default();
+        let mut recv = RecvStream {
+            id,
+            state: &mut *state,
+            pending: &mut pending,
+        };
+        let mut chunks = recv.read(true).unwrap();
+        let mut read = 0;
+        while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+            read += chunk.bytes.len() as u64;
+        }
+        let _ = chunks.finalize();
+        read
+    }
+
+    fn uni(i: u64) -> StreamId {
+        StreamId::new(Side::Server, Dir::Uni, i)
+    }
+
+    #[test]
+    fn unread_streams_starve_the_others_without_credit_on_receipt() {
+        let budget = budget_of(u64::MAX);
+        let mut client = tuned(&budget);
+        // Two streams fill their 64 KiB windows and are never read: 128 KiB of a 96 KiB window
+        receive(&mut client, uni(0), 0, 64 * KIB).unwrap();
+        receive(&mut client, uni(1), 0, 32 * KIB).unwrap();
+        assert!(receive(&mut client, uni(2), 0, 1).is_err());
+    }
+
+    #[test]
+    fn unread_streams_leave_the_others_credit_with_credit_on_receipt() {
+        let budget = budget_of(u64::MAX);
+        let mut client = lending(&budget);
+        for i in 0..10 {
+            receive(&mut client, uni(i), 0, 64 * KIB).unwrap();
+        }
+        // Ten stalled windows, 640 KiB, and the connection still takes a live stream's data
+        assert_eq!(client.lent, 640 * KIB);
+        assert_eq!(*budget.held.lock().unwrap(), 640 * KIB);
+        let live = uni(10);
+        let mut offset = 0;
+        for _ in 0..20 {
+            receive(&mut client, live, offset, 32 * KIB).unwrap();
+            offset += 32 * KIB;
+            assert_eq!(read_all(&mut client, live), 32 * KIB);
+            let rs = client.recv.get_mut(&live).unwrap().as_mut().unwrap();
+            let rs = rs.as_open_recv_mut().unwrap();
+            let (max, _) = rs.max_stream_data();
+            rs.record_sent_max_stream_data(max);
+        }
+        // What the live stream read was repaid; the stalled streams' loans remain
+        assert_eq!(client.lent, 640 * KIB);
+    }
+
+    #[test]
+    fn loans_stop_at_the_budget_and_credit_comes_back_on_read() {
+        // Room for one stalled window
+        let budget = budget_of(64 * KIB);
+        let mut client = lending(&budget);
+        receive(&mut client, uni(0), 0, 64 * KIB).unwrap();
+        receive(&mut client, uni(1), 0, 64 * KIB).unwrap();
+        assert_eq!(client.lent, 64 * KIB, "the second is refused");
+        assert_eq!(*budget.held.lock().unwrap(), 64 * KIB);
+        // Refused, the second holds its 64 KiB of the connection as without loans: of 160 KiB
+        // of credit, 128 is received, which leaves 32 KiB for others
+        receive(&mut client, uni(2), 0, 32 * KIB).unwrap();
+        assert!(receive(&mut client, uni(3), 0, 1).is_err());
+        // Reading the refused stream gives its credit back to the connection as usual
+        let before = client.local_max_data;
+        assert_eq!(read_all(&mut client, uni(1)), 64 * KIB);
+        assert_eq!(client.local_max_data, before + 64 * KIB);
+        assert_eq!(client.lent, 64 * KIB);
+        // Reading the lent one repays the budget and adds no credit twice
+        let before = client.local_max_data;
+        assert_eq!(read_all(&mut client, uni(0)), 64 * KIB);
+        assert_eq!(client.local_max_data, before);
+        assert_eq!(client.lent, 0);
+        assert_eq!(*budget.held.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn loans_never_pass_the_budget() {
+        let budget = budget_of(200 * KIB);
+        let mut client = lending(&budget);
+        for i in 0..100 {
+            let _ = receive(&mut client, uni(i), 0, 64 * KIB);
+            assert!(*budget.held.lock().unwrap() <= 200 * KIB);
+        }
+        assert_eq!(client.lent, 192 * KIB);
+    }
+
+    #[test]
+    fn stopped_reset_and_dropped_streams_repay_their_loans() {
+        let budget = budget_of(u64::MAX);
+        let mut client = lending(&budget);
+        for i in 0..3 {
+            receive(&mut client, uni(i), 0, 64 * KIB).unwrap();
+        }
+        let credit = client.local_max_data;
+        let mut pending = Retransmits::default();
+        RecvStream {
+            id: uni(0),
+            state: &mut client,
+            pending: &mut pending,
+        }
+        .stop(0u32.into())
+        .unwrap();
+        assert_eq!(
+            client.local_max_data, credit,
+            "a stop credits nothing lent twice"
+        );
+        assert_eq!(client.lent, 128 * KIB);
+        let _ = client
+            .received_reset(frame::ResetStream {
+                id: uni(1),
+                error_code: 0u32.into(),
+                final_offset: VarInt::from_u64(64 * KIB).unwrap(),
+            })
+            .unwrap();
+        assert_eq!(
+            client.local_max_data, credit,
+            "a reset credits nothing lent twice"
+        );
+        assert_eq!(client.lent, 64 * KIB);
+        drop(client);
+        assert_eq!(*budget.held.lock().unwrap(), 0);
     }
 
     #[test]

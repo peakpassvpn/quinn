@@ -406,6 +406,7 @@ pub struct WindowTuning {
     pub(crate) receive_window_max: u64,
     pub(crate) send_window_max: u64,
     pub(crate) budget: Option<Arc<dyn WindowBudget>>,
+    pub(crate) credit_on_receipt: bool,
 }
 
 impl WindowTuning {
@@ -420,12 +421,26 @@ impl WindowTuning {
             receive_window_max: receive_window_max.into(),
             send_window_max,
             budget: None,
+            credit_on_receipt: false,
         }
     }
 
     /// The budget, shared by any number of connections, that window growth is asked of
     pub fn budget(mut self, budget: Arc<dyn WindowBudget>) -> Self {
         self.budget = Some(budget);
+        self
+    }
+
+    /// Gives connection-level credit back as stream data arrives, not as it is read
+    ///
+    /// Without it, a stream whose data is never read holds its share of the connection's window
+    /// until it is, and enough such streams leave the others no credit at all. With it, the
+    /// connection's window bounds only what is in flight: the data a stream holds unread is lent
+    /// credit, asked of the budget and given back as the stream is read, stopped, reset or freed,
+    /// so each stream holds at most its own window. Where the budget refuses, credit comes back
+    /// on read as without it. No effect without a budget.
+    pub fn credit_on_receipt(mut self, enabled: bool) -> Self {
+        self.credit_on_receipt = enabled;
         self
     }
 }
@@ -437,6 +452,7 @@ impl fmt::Debug for WindowTuning {
             .field("receive_window_max", &self.receive_window_max)
             .field("send_window_max", &self.send_window_max)
             .field("budget", &self.budget.is_some())
+            .field("credit_on_receipt", &self.credit_on_receipt)
             .finish()
     }
 }

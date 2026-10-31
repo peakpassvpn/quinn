@@ -1,6 +1,6 @@
 use std::{
     collections::{BinaryHeap, hash_map},
-    io,
+    io, mem,
 };
 
 use bytes::Bytes;
@@ -140,6 +140,7 @@ impl RecvStream<'_> {
         };
         let stream = get_or_insert_recv(self.state.stream_receive_window)(entry.get_mut());
 
+        let lent = mem::take(&mut stream.lent);
         let (read_credits, stop_sending) = stream.stop()?;
         if stop_sending.should_transmit() {
             self.pending.stop_sending.push(frame::StopSending {
@@ -156,7 +157,11 @@ impl RecvStream<'_> {
             self.state.stream_recv_freed(self.id, recv);
         }
 
-        if self.state.add_read_credits(read_credits).should_transmit() {
+        if self
+            .state
+            .read_credits(read_credits, lent)
+            .should_transmit()
+        {
             self.pending.max_data = true;
         }
 

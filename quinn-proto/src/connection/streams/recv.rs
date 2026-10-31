@@ -23,6 +23,9 @@ pub(super) struct Recv {
     pub(super) window: u64,
     /// Since when, and from which offset, reads count towards the window's next growth
     pub(super) epoch: Option<(Instant, u64)>,
+    /// Connection-level credit given for this stream's data before it was read, owed to the
+    /// budget until it is
+    pub(super) lent: u64,
 }
 
 impl Recv {
@@ -35,6 +38,7 @@ impl Recv {
             stopped: false,
             window: initial_max_data,
             epoch: None,
+            lent: 0,
         })
     }
 
@@ -47,6 +51,7 @@ impl Recv {
         self.stopped = false;
         self.window = initial_max_data;
         self.epoch = None;
+        self.lent = 0;
     }
 
     /// Process a STREAM frame
@@ -261,6 +266,8 @@ pub struct Chunks<'a> {
     pending: &'a mut Retransmits,
     state: ChunksState,
     read: u64,
+    /// What of `read` was lent credit, given for it on receipt
+    repaid: u64,
 }
 
 impl<'a> Chunks<'a> {
@@ -288,6 +295,7 @@ impl<'a> Chunks<'a> {
             pending,
             state: ChunksState::Readable(recv),
             read: 0,
+            repaid: 0,
         })
     }
 
@@ -308,6 +316,9 @@ impl<'a> Chunks<'a> {
 
         if let Some(chunk) = rs.assembler.read(max_length, self.ordered) {
             self.read += chunk.bytes.len() as u64;
+            let repaid = rs.lent.min(chunk.bytes.len() as u64);
+            rs.lent -= repaid;
+            self.repaid += repaid;
             return Ok(Some(chunk));
         }
 
@@ -384,7 +395,7 @@ impl<'a> Chunks<'a> {
         }
 
         // Issue connection-level flow control credit for any data we read regardless of state
-        let max_data = self.streams.add_read_credits(self.read);
+        let max_data = self.streams.read_credits(self.read, self.repaid);
         self.pending.max_data |= max_data.0;
         should_transmit |= max_data.0;
         ShouldTransmit(should_transmit)
