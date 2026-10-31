@@ -533,6 +533,10 @@ impl AsyncUdpSocket for FailingSocket {
         self.inner.max_receive_segments()
     }
 
+    fn max_receive_batch(&self) -> usize {
+        self.inner.max_receive_batch()
+    }
+
     fn may_fragment(&self) -> bool {
         self.inner.may_fragment()
     }

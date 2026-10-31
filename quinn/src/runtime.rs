@@ -79,6 +79,18 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
         1
     }
 
+    /// Most [`RecvMeta`]s one [`poll_recv`](Self::poll_recv) is given room for, at most
+    /// [`udp::BATCH_SIZE`] and at least 1
+    ///
+    /// The endpoint keeps a receive buffer of this many times [`max_receive_segments`]
+    /// datagrams for as long as it lives: with GRO on Linux, 32 × 64 of them, about 3 MB. A
+    /// smaller batch takes fewer datagrams per system call for less memory.
+    ///
+    /// [`max_receive_segments`]: Self::max_receive_segments
+    fn max_receive_batch(&self) -> usize {
+        udp::BATCH_SIZE
+    }
+
     /// Whether datagrams might get fragmented into multiple parts
     ///
     /// Sockets should prevent this for best performance. See e.g. the `IPV6_DONTFRAG` socket

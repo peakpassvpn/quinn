@@ -732,7 +732,12 @@ impl EndpointRef {
         runtime: Arc<dyn Runtime>,
     ) -> Self {
         let (sender, events) = mpsc::unbounded_channel();
-        let recv_state = RecvState::new(sender, socket.max_receive_segments(), &inner);
+        let recv_state = RecvState::new(
+            sender,
+            socket.max_receive_segments(),
+            socket.max_receive_batch(),
+            &inner,
+        );
         Self(Arc::new(EndpointInner {
             shared: Shared {
                 incoming: Notify::new(),
@@ -790,6 +795,8 @@ struct RecvState {
     incoming: VecDeque<proto::Incoming>,
     connections: ConnectionSet,
     recv_buf: Box<[u8]>,
+    /// Datagrams one receive takes, at most `BATCH_SIZE`: `recv_buf` holds this many
+    batch: usize,
     recv_limiter: WorkLimiter,
 }
 
@@ -797,13 +804,15 @@ impl RecvState {
     fn new(
         sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
         max_receive_segments: usize,
+        batch: usize,
         endpoint: &proto::Endpoint,
     ) -> Self {
+        let batch = batch.clamp(1, BATCH_SIZE);
         let recv_buf = vec![
             0;
             endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize
                 * max_receive_segments
-                * BATCH_SIZE
+                * batch
         ];
         Self {
             connections: ConnectionSet {
@@ -813,6 +822,7 @@ impl RecvState {
             },
             incoming: VecDeque::new(),
             recv_buf: recv_buf.into(),
+            batch,
             recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
         }
     }
@@ -826,20 +836,20 @@ impl RecvState {
         now: Instant,
     ) -> Result<PollProgress, io::Error> {
         let mut received_connection_packet = false;
+        let batch = self.batch;
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
         let mut iovs: [IoSliceMut; BATCH_SIZE] = {
             let mut bufs = self
                 .recv_buf
-                .chunks_mut(self.recv_buf.len() / BATCH_SIZE)
+                .chunks_mut(self.recv_buf.len() / batch)
                 .map(IoSliceMut::new);
 
-            // expect() safe as self.recv_buf is chunked into BATCH_SIZE items
-            // and iovs will be of size BATCH_SIZE, thus from_fn is called
-            // exactly BATCH_SIZE times.
-            std::array::from_fn(|_| bufs.next().expect("BATCH_SIZE elements"))
+            // self.recv_buf is chunked into `batch` items, no more than BATCH_SIZE; the
+            // rest of the array is empty and never handed to the socket.
+            std::array::from_fn(|_| bufs.next().unwrap_or_else(|| IoSliceMut::new(&mut [])))
         };
         loop {
-            match socket.poll_recv(cx, &mut iovs, &mut metas) {
+            match socket.poll_recv(cx, &mut iovs[..batch], &mut metas[..batch]) {
                 Poll::Ready(Ok(msgs)) => {
                     self.recv_limiter.record_work(msgs);
                     for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
@@ -936,11 +946,23 @@ mod tests {
     use crate::{UdpPoller, runtime::TokioRuntime};
 
     #[test]
+    fn receive_buffer_follows_the_socket_batch() {
+        let endpoint = proto::Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+        let datagram = endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize;
+        for (asked, batch) in [(0, 1), (4, 4.min(BATCH_SIZE)), (usize::MAX, BATCH_SIZE)] {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let state = RecvState::new(tx, 2, asked, &endpoint);
+            assert_eq!(state.batch, batch);
+            assert_eq!(state.recv_buf.len(), datagram * 2 * batch);
+        }
+    }
+
+    #[test]
     fn ignored_receive_errors_respect_work_budget() {
         let mut endpoint =
             proto::Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut state = RecvState::new(tx, 1, &endpoint);
+        let mut state = RecvState::new(tx, 1, BATCH_SIZE, &endpoint);
         let now = Instant::now();
 
         // Calibrate the next receive cycles to allow two work items each.
