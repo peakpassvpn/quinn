@@ -1001,6 +1001,10 @@ impl StreamsState {
             .max(allowed.min(paced))
             .clamp(self.send_window_base, max)
             - self.send_window_base;
+        // Keep already-paid storage charged until ACKs or reset release it. An explicit
+        // base reduction must not retroactively charge data accepted under the old base.
+        let retained = self.buffered_data.saturating_sub(self.send_window_base);
+        let wanted = wanted.max(retained.min(self.send_granted));
         if wanted > self.send_granted {
             if self.take(wanted - self.send_granted) {
                 self.send_granted = wanted;
@@ -1735,6 +1739,240 @@ mod tests {
         client.max_data = 4096 * KIB;
         client.tick(now, Duration::from_millis(50), 16 * KIB);
         assert_eq!(client.send_window, 64 * KIB);
+        assert_eq!(*budget.held.lock().unwrap(), 0);
+    }
+
+    /// A sender with two distinct 512 KiB allocations, all transmitted but not acknowledged.
+    fn full_budgeted_sender(budget: &Arc<Counted>) -> (StreamsState, StreamId) {
+        let mut client = tuned(budget);
+        client.set_params(&TransportParameters {
+            initial_max_data: VarInt::MAX,
+            initial_max_stream_data_uni: VarInt::MAX,
+            initial_max_streams_uni: 1u32.into(),
+            ..TransportParameters::default()
+        });
+        client.tick(Instant::now(), Duration::from_millis(50), 512 * KIB);
+        assert_eq!(client.send_window, 1024 * KIB);
+        let mut pending = Retransmits::default();
+        let conn_state = ConnState::Established;
+        let id = Streams {
+            state: &mut client,
+            conn_state: &conn_state,
+        }
+        .open(Dir::Uni)
+        .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                SendStream {
+                    id,
+                    state: &mut client,
+                    pending: &mut pending,
+                    conn_state: &conn_state,
+                }
+                .write(&vec![42; (512 * KIB) as usize]),
+                Ok((512 * KIB) as usize)
+            );
+        }
+        let send = client.send.get_mut(&id).unwrap().as_mut().unwrap();
+        assert_eq!(
+            send.pending.poll_transmit((1024 * KIB + 16) as usize).0,
+            0..1024 * KIB
+        );
+        assert_eq!(client.buffered_data, 1024 * KIB);
+        (client, id)
+    }
+
+    fn tick_small_send_window(client: &mut StreamsState) {
+        client.tick(Instant::now(), Duration::from_millis(50), 16 * KIB);
+    }
+
+    #[test]
+    fn shrinking_send_window_keeps_retained_storage_charged() {
+        let budget = budget_of(960 * KIB);
+        let (mut client, _) = full_budgeted_sender(&budget);
+        for _ in 0..4 {
+            tick_small_send_window(&mut client);
+            assert_eq!(client.buffered_data, 1024 * KIB);
+            assert_eq!(client.send_granted, 960 * KIB);
+            assert_eq!(client.send_window, 1024 * KIB);
+            assert_eq!(*budget.held.lock().unwrap(), 960 * KIB);
+        }
+        drop(client);
+        assert_eq!(*budget.held.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn send_charge_follows_released_allocations_after_partial_ack() {
+        let budget = budget_of(960 * KIB);
+        let (mut client, id) = full_budgeted_sender(&budget);
+        client.received_ack_of(frame::StreamMeta {
+            id,
+            offsets: 0..256 * KIB,
+            fin: false,
+        });
+        tick_small_send_window(&mut client);
+        assert_eq!(
+            client.buffered_data,
+            1024 * KIB,
+            "partial prefix retains its allocation"
+        );
+        assert_eq!(*budget.held.lock().unwrap(), 960 * KIB);
+        client.received_ack_of(frame::StreamMeta {
+            id,
+            offsets: 256 * KIB..512 * KIB,
+            fin: false,
+        });
+        tick_small_send_window(&mut client);
+        assert_eq!(client.buffered_data, 512 * KIB);
+        assert_eq!(client.send_granted, 448 * KIB);
+        assert_eq!(*budget.held.lock().unwrap(), 448 * KIB);
+        client.received_ack_of(frame::StreamMeta {
+            id,
+            offsets: 512 * KIB..1024 * KIB,
+            fin: false,
+        });
+        tick_small_send_window(&mut client);
+        assert_eq!(client.buffered_data, 0);
+        assert_eq!(*budget.held.lock().unwrap(), 0);
+        drop(client);
+        assert_eq!(*budget.held.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn selective_ack_keeps_send_charge_until_storage_is_released() {
+        let budget = budget_of(960 * KIB);
+        let (mut client, id) = full_budgeted_sender(&budget);
+        client.received_ack_of(frame::StreamMeta {
+            id,
+            offsets: 512 * KIB..1024 * KIB,
+            fin: false,
+        });
+        tick_small_send_window(&mut client);
+        assert_eq!(client.buffered_data, 1024 * KIB);
+        assert_eq!(*budget.held.lock().unwrap(), 960 * KIB);
+        client.received_ack_of(frame::StreamMeta {
+            id,
+            offsets: 0..512 * KIB,
+            fin: false,
+        });
+        tick_small_send_window(&mut client);
+        assert_eq!(client.buffered_data, 0);
+        assert_eq!(*budget.held.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn retained_send_charge_cannot_be_reused_by_another_connection() {
+        let budget = budget_of(960 * KIB);
+        let (mut first, _) = full_budgeted_sender(&budget);
+        tick_small_send_window(&mut first);
+        let mut second = tuned(&budget);
+        second.tick(Instant::now(), Duration::from_millis(50), 512 * KIB);
+        assert_eq!(
+            second.send_window,
+            64 * KIB,
+            "the first still holds its allocation"
+        );
+        assert_eq!(*budget.held.lock().unwrap(), 960 * KIB);
+        drop(first);
+        second.tick(Instant::now(), Duration::from_millis(50), 512 * KIB);
+        assert_eq!(second.send_window, 1024 * KIB);
+        drop(second);
+        assert_eq!(*budget.held.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn shrinking_send_window_wakes_writer_only_after_drain() {
+        let budget = budget_of(960 * KIB);
+        let (mut client, id) = full_budgeted_sender(&budget);
+        let mut pending = Retransmits::default();
+        let conn_state = ConnState::Established;
+        assert_eq!(
+            SendStream {
+                id,
+                state: &mut client,
+                pending: &mut pending,
+                conn_state: &conn_state
+            }
+            .write(&[7]),
+            Err(WriteError::Blocked)
+        );
+        tick_small_send_window(&mut client);
+        assert_eq!(client.poll(), None);
+        client.received_ack_of(frame::StreamMeta {
+            id,
+            offsets: 0..512 * KIB,
+            fin: false,
+        });
+        tick_small_send_window(&mut client);
+        assert_eq!(client.poll(), None);
+        client.received_ack_of(frame::StreamMeta {
+            id,
+            offsets: 512 * KIB..1024 * KIB,
+            fin: false,
+        });
+        tick_small_send_window(&mut client);
+        assert_eq!(client.poll(), Some(StreamEvent::Writable { id }));
+        assert_eq!(
+            SendStream {
+                id,
+                state: &mut client,
+                pending: &mut pending,
+                conn_state: &conn_state
+            }
+            .write(&[7]),
+            Ok(1)
+        );
+        assert_eq!(*budget.held.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn reset_and_finish_release_send_charge_once() {
+        for reset in [true, false] {
+            let budget = budget_of(960 * KIB);
+            let (mut client, id) = full_budgeted_sender(&budget);
+            tick_small_send_window(&mut client);
+            let mut pending = Retransmits::default();
+            let conn_state = ConnState::Established;
+            let mut stream = SendStream {
+                id,
+                state: &mut client,
+                pending: &mut pending,
+                conn_state: &conn_state,
+            };
+            if reset {
+                stream.reset(0u32.into()).unwrap();
+            } else {
+                stream.finish().unwrap();
+                client.received_ack_of(frame::StreamMeta {
+                    id,
+                    offsets: 0..1024 * KIB,
+                    fin: true,
+                });
+            }
+            tick_small_send_window(&mut client);
+            assert_eq!(client.buffered_data, 0);
+            assert_eq!(*budget.held.lock().unwrap(), 0);
+            tick_small_send_window(&mut client);
+            drop(client);
+            assert_eq!(*budget.held.lock().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn decreasing_send_base_does_not_charge_existing_base_data_retroactively() {
+        let budget = budget_of(1024 * KIB);
+        let (mut client, _) = full_budgeted_sender(&budget);
+        client.set_send_window(32 * KIB);
+        tick_small_send_window(&mut client);
+        assert_eq!(client.send_granted, 960 * KIB);
+        assert_eq!(*budget.held.lock().unwrap(), 960 * KIB);
+        assert_eq!(client.buffered_data, 1024 * KIB);
+        assert_eq!(
+            client.send_window,
+            992 * KIB,
+            "an explicit base reduction remains allowed below retained storage"
+        );
+        drop(client);
         assert_eq!(*budget.held.lock().unwrap(), 0);
     }
 

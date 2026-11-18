@@ -153,6 +153,12 @@ minor line (0.12) is a merge of that line, done when sail moves its
   comes back on read as upstream's does. No reference implementation
   does this; nothing changes on the wire.
 
+- **Retained send-storage accounting** (`quinn-proto`): when the adaptive
+  send window shrinks, already-granted growth stays charged until its
+  retained application buffers are released by ACKs or reset. Partial or
+  selective ACKs that retain allocations keep their charge, so another
+  connection cannot reuse budget still backing those buffers (sail#52).
+
 ## Ahead of the release
 
 The latest full upstream merge is the `0.11.x` line's tip as of
